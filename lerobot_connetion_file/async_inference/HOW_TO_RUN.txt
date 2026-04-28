@@ -1,0 +1,105 @@
+HOW TO RUN THE EXTERNAL PLANNER BRIDGE
+=======================================
+
+OVERVIEW
+--------
+Three processes need to run (in order):
+
+  1. Your external planner    -- HTTP server, any language/framework
+  2. ExternalPlannerServer    -- bridge between robot (gRPC) and planner (HTTP)
+  3. RobotClient              -- connects to the real robot arm
+
+
+STEP 1: Start your external planner (HTTP server)
+--------------------------------------------------
+Your planner must expose a POST endpoint that:
+
+  - Receives JSON:
+      {
+        "timestep": int,
+        "timestamp": float,
+        "must_go": bool,
+        "observation": {
+          "task": "string describing the task",
+          "observation.state": [float, float, ...]   // joint positions
+        }
+      }
+
+  - Returns JSON:
+      {
+        "actions": [
+          [float, float, ...],   // action for step N   (one float per joint)
+          [float, float, ...],   // action for step N+1
+          ...                    // return as many steps as you want
+        ]
+      }
+
+  To test with the mock planner included in this repo:
+      python -m lerobot.async_inference.test_communication planner
+
+
+STEP 2: Start the bridge server
+--------------------------------
+  python -m lerobot.async_inference.external_planner_server \
+      --host=0.0.0.0 \
+      --port=8080 \
+      --planner_url=http://<PLANNER_IP>:9090/plan \
+      --environment_dt=0.033 \
+      --obs_queue_timeout=1.0 \
+      --http_timeout=5.0
+
+  Arguments:
+    --host              IP to bind the gRPC server (0.0.0.0 = all interfaces)
+    --port              Port the robot client will connect to (default: 8080)
+    --planner_url       Full URL of your external planner endpoint
+    --environment_dt    Control period in seconds (1/fps, e.g. 0.033 for 30fps)
+    --obs_queue_timeout Seconds to wait for an observation before returning empty
+    --include_images    Add this flag if your planner needs camera images (large payload)
+    --http_timeout      Seconds before giving up on planner HTTP response
+
+
+STEP 3: Start the robot client
+--------------------------------
+  python -m lerobot.async_inference.robot_client \
+      --robot.type=so100_follower \
+      --robot.port=/dev/ttyUSB0 \
+      --robot.id=my_robot \
+      --server_address=<BRIDGE_IP>:8080 \
+      --task="pick up the cup" \
+      --policy_type=act \
+      --pretrained_name_or_path=any/string \
+      --actions_per_chunk=10 \
+      --policy_device=cpu \
+      --client_device=cpu
+
+  Note: --task is a plain text description sent to your planner inside the observation.
+        Use any string that makes sense for your planner, or just "test".
+
+  The arm will start moving as soon as the robot client receives the first actions
+  from the bridge server.
+
+
+TEST WITHOUT A REAL ROBOT
+--------------------------
+Open 3 terminals and run each line in order:
+
+  Terminal 1:   python -m lerobot.async_inference.test_communication planner
+  Terminal 2:   python -m lerobot.async_inference.test_communication bridge
+  Terminal 3:   python -m lerobot.async_inference.test_communication robot
+
+  Terminal 3 should print the actions received back from the planner.
+  If you see "Received N actions", the full communication chain is working.
+
+
+STARTUP ORDER
+-------------
+  Planner must be running before the bridge starts.
+  Bridge must be running before the robot client starts.
+  The robot arm only moves after the robot client receives its first action chunk.
+
+
+PORTS SUMMARY
+-------------
+  Bridge gRPC port  : 8080  (robot client connects here)
+  Planner HTTP port : 9090  (bridge connects here)
+  Both ports must be open in your firewall/router if running on separate machines.

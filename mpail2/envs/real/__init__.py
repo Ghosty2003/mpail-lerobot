@@ -1,4 +1,15 @@
-"""Minimal real-robot envs: Kinova (ROS twist + TF) and Franka (Frankz client + RealSense + wrapper)."""
+"""Minimal real-robot envs: Kinova (ROS twist + TF), Franka (Frankz client + RealSense), SO-101 (LeRobot HTTP)."""
+
+from .so101 import (
+    ACTION_DIM as SO101_ACTION_DIM,
+    SO101RealEnvArgs,
+    SO101RealWrapper,
+    SO101RobotEnv,
+    STATE_DIM as SO101_STATE_DIM,
+    MAX_EPISODE_STEPS as SO101_MAX_EPISODE_STEPS,
+    OBS_KEY as SO101_OBS_KEY,
+    make_so101_env,
+)
 
 from .kinova import (
     ACTION_DIM as KINOVA_ACTION_DIM,
@@ -14,6 +25,16 @@ from .kinova import (
 )
 
 __all__ = [
+    # SO-101
+    "SO101RobotEnv",
+    "SO101RealWrapper",
+    "SO101RealEnvArgs",
+    "SO101_STATE_DIM",
+    "SO101_ACTION_DIM",
+    "SO101_MAX_EPISODE_STEPS",
+    "SO101_OBS_KEY",
+    "make_so101_env",
+    # Kinova
     "KinovaRealWrapper",
     "KinovaRealEnvArgs",
     "ManipulationAction",
