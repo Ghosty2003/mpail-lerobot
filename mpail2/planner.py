@@ -159,7 +159,11 @@ class Planner(torch.nn.Module):
         # Evaluate single step rewards
         states = rollouts[..., :-1, :]
         next_states = rollouts[..., 1:, :]
-        rewards[...] = self.reward(state=states, action=actions, next_state=next_states)
+        rewards[...] = torch.clamp(
+            self.reward(state=states, action=actions, next_state=next_states),
+            -20.0,
+            20.0,
+        )
 
         # Evaluate terminal state value
         ts_states = states[..., -1, :]

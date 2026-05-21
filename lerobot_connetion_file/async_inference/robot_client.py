@@ -58,6 +58,13 @@ from lerobot.robots import (  # noqa: F401
     omx_follower,
     so_follower,
 )
+from lerobot.teleoperators import (  # noqa: F401
+    bi_so_leader,
+    koch_leader,
+    make_teleoperator_from_config,
+    omx_leader,
+    so_leader,
+)
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
@@ -95,6 +102,11 @@ class RobotClient:
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
 
+        self.teleop = make_teleoperator_from_config(config.teleop) if config.teleop else None
+        if self.teleop:
+            self.teleop.connect()
+            self.logger.info("Teleoperator (leader arm) connected — running in teleoperation mode.")
+
         lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
 
         # Use environment variable if server_address is not provided in config
@@ -129,6 +141,9 @@ class RobotClient:
 
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=self.config.fps)
+
+        # Episode step counter (incremented in control_loop_action)
+        self._step_count = 0
 
         self.logger.info("Robot connected and ready")
 
@@ -170,9 +185,70 @@ class RobotClient:
             self.logger.error(f"Failed to connect to policy server: {e}")
             return False
 
+    # ------------------------------------------------------------------
+    # Home position / smooth reset  (mirrors HTTP robot_server feature)
+    # ------------------------------------------------------------------
+
+    def move_to_home_slowly(self) -> None:
+        """Linearly interpolate from current joint positions to home over
+        reset_steps steps at reset_hz Hz.  No-op if home_joints is empty."""
+        if not self.config.home_joints:
+            return
+
+        joint_names = list(self.robot.action_features.keys())
+        home_values = [float(v) for v in self.config.home_joints.split()]
+        if len(home_values) != len(joint_names):
+            raise ValueError(
+                f"home_joints has {len(home_values)} values but robot has "
+                f"{len(joint_names)} joints: {joint_names}"
+            )
+
+        raw_obs = self.robot.get_observation()
+        current = [float(raw_obs[k]) for k in joint_names]
+
+        dt = 1.0 / self.config.reset_hz
+        self.logger.info(
+            f"Moving to home over {self.config.reset_steps} steps "
+            f"at {self.config.reset_hz} Hz "
+            f"({self.config.reset_steps / self.config.reset_hz:.1f}s)"
+        )
+        for i in range(1, self.config.reset_steps + 1):
+            t = i / self.config.reset_steps
+            interp = {k: c + t * (g - c) for k, c, g in zip(joint_names, current, home_values)}
+            self.robot.send_action(interp)
+            time.sleep(dt)
+        self.logger.info("Home position reached.")
+
+    # ------------------------------------------------------------------
+    # Episode helpers
+    # ------------------------------------------------------------------
+
+    def _stop_episode(self) -> None:
+        """End the current episode loop without disconnecting the robot."""
+        self.shutdown_event.set()
+
+    def reset_for_new_episode(self) -> None:
+        """Reset all in-memory state so a new episode can start cleanly.
+        The robot stays connected; call move_to_home_slowly() separately."""
+        self.shutdown_event.clear()
+        self.action_queue = Queue()
+        self.action_queue_size = []
+        with self.latest_action_lock:
+            self.latest_action = -1
+        self.action_chunk_size = -1
+        self.must_go = threading.Event()
+        self.must_go.set()
+        self._step_count = 0
+        self.start_barrier = threading.Barrier(2)
+        self.fps_tracker.reset()
+
     def stop(self):
         """Stop the robot client"""
         self.shutdown_event.set()
+
+        if self.teleop:
+            self.teleop.disconnect()
+            self.logger.debug("Teleoperator disconnected")
 
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
@@ -213,6 +289,29 @@ class RobotClient:
         except grpc.RpcError as e:
             self.logger.error(f"Error sending observation #{obs.get_timestep()}: {e}")
             return False
+
+    def plan_direct(self, obs: TimedObservation) -> list[TimedAction]:
+        """Send an observation and receive actions in one synchronous gRPC call (Plan RPC).
+
+        Alternative to the SendObservations + GetActions two-step.  Blocks until the
+        server returns the planned actions.  Returns an empty list on failure.
+        """
+        observation_bytes = pickle.dumps(obs)
+        observation_iterator = send_bytes_in_chunks(
+            observation_bytes,
+            services_pb2.Observation,
+            log_prefix="[CLIENT] Plan",
+            silent=True,
+        )
+        try:
+            actions_chunk = self.stub.Plan(observation_iterator)
+            if len(actions_chunk.data) == 0:
+                return []
+            timed_actions: list[TimedAction] = pickle.loads(actions_chunk.data)  # nosec
+            return timed_actions
+        except grpc.RpcError as e:
+            self.logger.error(f"Plan RPC error: {e}")
+            return []
 
     def _inspect_action_queue(self):
         with self.action_queue_lock:
@@ -384,6 +483,12 @@ class RobotClient:
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
 
+        # Episode step counter — stop after max_episode_steps if set
+        self._step_count += 1
+        if self.config.max_episode_steps and self._step_count >= self.config.max_episode_steps:
+            self.logger.info(f"Episode done: reached {self._step_count} steps.")
+            self._stop_episode()
+
         if verbose:
             with self.action_queue_lock:
                 current_queue_size = self.action_queue.qsize()
@@ -406,6 +511,8 @@ class RobotClient:
             return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
 
     def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
+        if not self.running:
+            return
         try:
             # Get serialized observation bytes from the function
             start_time = time.perf_counter()
@@ -419,7 +526,7 @@ class RobotClient:
             observation = TimedObservation(
                 timestamp=time.time(),  # need time.time() to compare timestamps across client and server
                 observation=raw_observation,
-                timestep=max(latest_action, 0),
+                timestep=max(latest_action + 1, 0),
             )
 
             obs_capture_time = time.perf_counter() - start_time
@@ -452,8 +559,80 @@ class RobotClient:
 
             return raw_observation
 
+        except RuntimeError as e:
+            msg = str(e)
+            if "read thread is not running" in msg or "camera" in msg.lower():
+                self.logger.warning(f"Camera error — attempting reconnect: {e}")
+                try:
+                    self.robot.disconnect()
+                    time.sleep(1.0)
+                    self.robot.connect()
+                    self.logger.info("Robot reconnected successfully.")
+                except Exception as reconnect_err:
+                    self.logger.error(f"Reconnect failed — stopping episode: {reconnect_err}")
+                    self._stop_episode()
+            else:
+                self.logger.error(f"Error in observation sender: {e}")
         except Exception as e:
             self.logger.error(f"Error in observation sender: {e}")
+
+    def _teleop_control_loop(self, task: str, verbose: bool = False) -> None:
+        """Control loop for teleoperation mode.
+
+        The leader arm drives the follower.  Every step the observation
+        (including the actual teleop action under key 'teleop_action') is
+        streamed to the gRPC server so planner_server.py can record it.
+        No start_barrier is used — there is no action-receiver thread.
+        """
+        self.logger.info("Teleoperation control loop starting")
+
+        while self.running:
+            loop_start = time.perf_counter()
+
+            # 1. Read follower observation
+            try:
+                raw_obs: RawObservation = self.robot.get_observation()
+            except (ConnectionError, TimeoutError) as e:
+                self.logger.warning(f"Observation read failed, skipping: {e}")
+                time.sleep(self.config.environment_dt)
+                continue
+
+            # 2. Get and apply leader action
+            teleop_action = self.teleop.get_action()
+            self.robot.send_action(teleop_action)
+
+            # 3. Attach task + teleop action so the server can record them
+            raw_obs["task"] = task
+            raw_obs["teleop_action"] = list(teleop_action.values())
+
+            with self.latest_action_lock:
+                latest = self.latest_action
+
+            obs = TimedObservation(
+                timestamp=time.time(),
+                observation=raw_obs,
+                timestep=max(latest + 1, 0),
+                must_go=True,  # always send — no action queue to pace against
+            )
+            self.send_observation(obs)
+
+            with self.latest_action_lock:
+                self.latest_action += 1
+
+            # 4. Episode step counter
+            self._step_count += 1
+            if self.config.max_episode_steps and self._step_count >= self.config.max_episode_steps:
+                self.logger.info(f"Teleop episode done: reached {self._step_count} steps.")
+                self._stop_episode()
+
+            if verbose:
+                fps_metrics = self.fps_tracker.calculate_fps_metrics(obs.get_timestamp())
+                self.logger.info(
+                    f"Teleop step #{self._step_count} | "
+                    f"Avg FPS: {fps_metrics['avg_fps']:.2f}"
+                )
+
+            time.sleep(max(0.0, self.config.environment_dt - (time.perf_counter() - loop_start)))
 
     def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
         """Combined function for executing actions and streaming observations"""
@@ -481,35 +660,77 @@ class RobotClient:
         return _captured_observation, _performed_action
 
 
+def _run_one_episode(client: "RobotClient") -> None:
+    """Run one episode — teleop or policy mode."""
+    if client.teleop:
+        # Teleop: single thread, no action receiver needed
+        client._teleop_control_loop(task=client.config.task)
+    else:
+        # Policy: action receiver + control loop threads
+        action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
+        action_receiver_thread.start()
+        client.control_loop(task=client.config.task)
+        action_receiver_thread.join(timeout=2.0)
+
+
 @draccus.wrap()
 def async_client(cfg: RobotClientConfig):
     logging.info(pformat(asdict(cfg)))
 
-    # TODO: Assert if checking robot support is still needed with the plugin system
-    # if cfg.robot.type not in SUPPORTED_ROBOTS:
-    #     raise ValueError(f"Robot {cfg.robot.type} not yet supported!")
-
     client = RobotClient(cfg)
 
-    if client.start():
-        client.logger.info("Starting action receiver thread...")
+    if not client.start():
+        return
 
-        # Create and start action receiver thread
-        action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
+    episode_mode = cfg.max_episode_steps is not None or cfg.num_episodes is not None
+    num_episodes = cfg.num_episodes  # None = run forever
 
-        # Start action receiver thread
-        action_receiver_thread.start()
+    if not episode_mode:
+        # ── Original continuous behaviour (unchanged) ──────────────────
+        client.logger.info("Running in continuous mode (no episode limit).")
+        if client.teleop:
+            try:
+                client._teleop_control_loop(task=cfg.task)
+            finally:
+                client.stop()
+                client.logger.info("Client stopped")
+        else:
+            action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
+            action_receiver_thread.start()
+            try:
+                client.control_loop(task=cfg.task)
+            finally:
+                client.stop()
+                action_receiver_thread.join()
+                if cfg.debug_visualize_queue_size:
+                    visualize_action_queue_size(client.action_queue_size)
+                client.logger.info("Client stopped")
 
+    else:
+        # ── Episode mode (new) ─────────────────────────────────────────
+        ep = 0
         try:
-            # The main thread runs the control loop
-            client.control_loop(task=cfg.task)
-
+            while num_episodes is None or ep < num_episodes:
+                ep += 1
+                client.logger.info(f"── Episode {ep} ──────────────────────────")
+                if ep == 1:
+                    client.move_to_home_slowly()
+                _run_one_episode(client)
+                if num_episodes is None or ep < num_episodes:
+                    client.reset_for_new_episode()
+                    # Block until the server finishes training on the completed episode.
+                    client.logger.info("Waiting for server to complete training+reset...")
+                    client.stub.Ready(services_pb2.Empty())
+                    client.move_to_home_slowly()
+                    # Pause after arm is home — robot holds still, no images sent.
+                    if cfg.reset_pause_seconds > 0:
+                        client.logger.info(f"Scene reset pause: {cfg.reset_pause_seconds:.0f}s ...")
+                        time.sleep(cfg.reset_pause_seconds)
         finally:
             client.stop()
-            action_receiver_thread.join()
             if cfg.debug_visualize_queue_size:
                 visualize_action_queue_size(client.action_queue_size)
-            client.logger.info("Client stopped")
+            client.logger.info(f"Done — {ep} episode(s) completed.")
 
 
 if __name__ == "__main__":

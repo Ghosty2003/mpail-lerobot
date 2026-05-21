@@ -552,7 +552,11 @@ class MPAIL2Learner:
         """
 
         with torch.no_grad():
-            rewards_batch = self._reward(latent_batch, next_latent_batch, action=action_batch)
+            rewards_batch = torch.clamp(
+                self._reward(latent_batch, next_latent_batch, action=action_batch),
+                -20.0,
+                20.0,
+            )
             _next_plans = self._policy.plan(next_latent_batch) # [batch_size, H, action_dim]
             pred_next_latent_batch_traj = self._dynamics(
                 z0=next_latent_batch, controls=_next_plans,
@@ -665,8 +669,12 @@ class MPAIL2Learner:
         '''
 
         _gam, _H = self.value_learner_cfg.gamma, self.cfg.loss_horizon
-        _all_rewards = reward_fn( # [batch, H]
-            z_traj, next_z_traj, action=actions_traj
+        _all_rewards = torch.clamp(
+            reward_fn( # [batch, H]
+                z_traj, next_z_traj, action=actions_traj
+            ),
+            -20.0,
+            20.0,
         )
         _all_vals = value(z_traj, actions_traj, return_type=value_return_type)  # [batch, H] or [num_q, batch, H]
         if log_probs is not None:

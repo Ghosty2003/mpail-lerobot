@@ -14,7 +14,7 @@ The following settings MUST be set for each task:
 
 #### SHARED CONSTANTS ####
 OPT = "adam"
-LR = 3e-4
+LR = 1e-4
 HORIZON = 7
 OPT_ITERS = 5
 GAMMA = 0.99
@@ -175,10 +175,10 @@ class PlannerConfig(cfgs.PlannerCfg):
     temperature: float = 2.0
     opt_iters: int = OPT_ITERS
 
-    reward_cfg: RewardConfig = RewardConfig()
-    value_cfg: EnsembleValueConfig = EnsembleValueConfig()
-    sampling_cfg: PolicySamplingConfig = PolicySamplingConfig()
-    dynamics_cfg: DynamicsConfig = DynamicsConfig()
+    reward_cfg: RewardConfig = field(default_factory=RewardConfig)
+    value_cfg: EnsembleValueConfig = field(default_factory=EnsembleValueConfig)
+    sampling_cfg: PolicySamplingConfig = field(default_factory=PolicySamplingConfig)
+    dynamics_cfg: DynamicsConfig = field(default_factory=DynamicsConfig)
 
     seed: int = 42
     u_per_command: int = 1

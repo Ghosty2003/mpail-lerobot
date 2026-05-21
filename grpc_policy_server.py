@@ -24,7 +24,8 @@ Robot client (lerobot env, either mode):
         --server_address=127.0.0.1:8080 \\
         --task="pick up the cup" \\
         --actions_per_chunk=1 \\
-        --max_episode_steps=200
+        --max_episode_steps=100 \
+        --reset_pause_seconds=10
 """
 
 import argparse
@@ -66,10 +67,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("grpc_policy_server")
 
 _HALF_RANGE = (JOINT_UPPER_DEG - JOINT_LOWER_DEG) / 2.0
-
-# Steps to hold home-return commands between episodes.
-# At MAX_DELTA_DEG=10 and 1 Hz, worst-case travel is ~170°/10°=17 steps → 30 is safe.
-RESET_HOLD_STEPS = 30
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,12 +171,12 @@ class DemoRecorder:
         collect_dir.mkdir(parents=True, exist_ok=True)
 
         self._lock = threading.Lock()
-        self._obs_buf:       List[np.ndarray] = []
-        self._next_obs_buf:  List[np.ndarray] = []
-        self._image_bufs:    Dict[str, List[np.ndarray]] = {}
+        self._obs_buf:         List[np.ndarray] = []
+        self._next_obs_buf:    List[np.ndarray] = []
+        self._image_bufs:      Dict[str, List[np.ndarray]] = {}
         self._image_next_bufs: Dict[str, List[np.ndarray]] = {}
-        self._pending_obs:    Optional[np.ndarray] = None
-        self._pending_images: Dict[str, np.ndarray] = {}
+        self._pending_obs:     Optional[np.ndarray] = None
+        self._pending_images:  Dict[str, np.ndarray] = {}
         self._file_idx = 0
 
     def record(self, obs: np.ndarray, images: Dict[str, np.ndarray]):
@@ -237,39 +234,61 @@ class DemoRecorder:
 
 class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
 
-    def __init__(self, runner, device: str, mock: bool, recorder: Optional[DemoRecorder], speed_scale: float = 1.0):
+    def __init__(
+        self,
+        runner,
+        device: str,
+        mock: bool,
+        recorder: Optional[DemoRecorder],
+        speed_scale: float = 1.0,
+        eval_mode: bool = False,
+        gripper_update_every: int = 5,
+    ):
         self.runner      = runner      # None in mock mode
         self.device      = device
         self.mock        = mock
+        self.eval_mode   = eval_mode
         self.recorder    = recorder
         self.speed_scale = speed_scale
+        self.gripper_update_every = max(1, gripper_update_every)
 
         self._lock = threading.Lock()
         self._obs_queue: Queue = Queue(maxsize=1)
         self.shutdown_event = threading.Event()
 
         self._prev_obs_dict  = None
+        self._transition_open = False  # set after learner.act(), cleared after process_env_step
         self._episode_steps  = 0
         self._episode_count  = 0
         self._prev_timestep  = -1
         self._recording_paused = False   # True while waiting for Enter between episodes
+        self._actions_per_chunk = 1      # updated from SendPolicyInstructions
 
-        # Exploration noise: start at 0.5 (half the normalised action range), decay to 0.05
-        self._explore_noise  = 0.15
-        self._explore_min    = 0.05
-        self._explore_decay  = 0.95   # multiply after each episode
-
-        # Episode-reset state: while True, GetActions returns home-position commands
-        self._resetting              = False
-        self._reset_steps_remaining  = 0
+        # Exploration is handled by MPPI sampling (policy_proportion=0.05, max_std=2.0)
+        # — same as Franka. No episode-level noise decay needed.
+        self._prev_action_norm = None
+        self._lpf_alpha        = 0.6   # EMA weight on new action (lower = smoother, more lag)
+        self._last_gripper_deg = None
+        self._gripper_chunk_count = 0
 
     def Ready(self, request, context):
+        # Train synchronously on the just-completed episode.
+        # The client blocks on this call, so no observations arrive during training.
+        if not self.mock and not self.eval_mode and self._episode_steps > 0:
+            logger.info(f"Ready: training on episode {self._episode_count + 1} ({self._episode_steps} steps)...")
+            self._on_episode_end()
         logger.info(f"Robot client connected: {context.peer()}")
         self.shutdown_event.clear()
         self._obs_queue = Queue(maxsize=1)
         return services_pb2.Empty()
 
     def SendPolicyInstructions(self, request, context):
+        try:
+            policy_config = pickle.loads(request.data)  # nosec
+            self._actions_per_chunk = int(getattr(policy_config, "actions_per_chunk", 1))
+            logger.info(f"Policy instructions: actions_per_chunk={self._actions_per_chunk}")
+        except Exception as e:
+            logger.warning(f"Could not parse policy instructions: {e}")
         return services_pb2.Empty()
 
     def SendObservations(self, request_iterator, context):
@@ -300,64 +319,17 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
             timestep = timed_obs.get_timestep()
             joint_state, image_arrays = _parse_raw_obs(timed_obs.get_observation())
 
-            # Detect robot episode boundary BEFORE updating _prev_timestep.
-            # The client resets its timestep to 0 at each new episode.
-            episode_boundary = (timestep == 0 and self._prev_timestep > 0)
             self._prev_timestep = timestep
 
             # Record demo transition (skipped while paused between episodes)
             if self.recorder is not None and not self._recording_paused:
                 self.recorder.record(joint_state, image_arrays)
 
-            # Always push to obs queue so GetActions can respond (even during reset)
+            # Push to obs queue so GetActions can respond
             if self._obs_queue.full():
                 try: self._obs_queue.get_nowait()
                 except Empty: pass
             self._obs_queue.put((timestep, timed_obs.get_timestamp(), joint_state, image_arrays))
-
-            # During episode reset: skip RL; GetActions will drive the robot home
-            if self._resetting:
-                pass
-
-            # Online RL: close previous transition (only if act() was already called for it)
-            elif not self.mock and self._prev_obs_dict is not None \
-                    and self.runner.learner.transition.observations is not None:
-                obs_dict = _build_obs_dict(joint_state, image_arrays, self.device)
-                reward = torch.tensor([0.0], device=self.device)
-                # Mark done=True when the client signals a new episode has started
-                done = torch.tensor([1 if episode_boundary else 0], dtype=torch.long, device=self.device)
-                with self._lock:
-                    try:
-                        self.runner.learner.process_env_step(reward, done, {}, obs_dict)
-                    except OverflowError:
-                        # Buffer full before episode boundary — train now then retry
-                        logger.info("Buffer overflow mid-episode — triggering early training update")
-                        self._on_episode_end()
-                        self.runner.learner.process_env_step(reward, done, {}, obs_dict)
-                    self._episode_steps += 1
-                with torch.no_grad():
-                    z  = self.runner.learner._encoder(self._prev_obs_dict)
-                    zn = self.runner.learner._encoder(obs_dict)
-                    disc_r = self.runner.learner._reward(z, zn).item()
-                logger.info(
-                    f"[ep {self._episode_count + 1} step {self._episode_steps}]"
-                    f"{'  [episode end]' if episode_boundary else ''}"
-                    f"  disc_reward={disc_r:.4f}"
-                )
-
-                # Episode boundary: train now and start fresh
-                if episode_boundary:
-                    self._on_episode_end()
-                    self._prev_obs_dict = obs_dict  # first obs of new episode
-                # Buffer full mid-episode: train now, continue episode
-                elif self._episode_steps >= self.runner.learner.storage.num_steps_per_env:
-                    self._on_episode_end()
-                    self._prev_obs_dict = obs_dict
-                else:
-                    self._prev_obs_dict = obs_dict
-
-            elif not self.mock:
-                self._prev_obs_dict = _build_obs_dict(joint_state, image_arrays, self.device)
 
         except Exception as e:
             logger.exception(f"SendObservations processing error: {e}")
@@ -370,18 +342,7 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
         except Empty:
             return services_pb2.Actions(data=b"")
 
-        if self._resetting:
-            # Drive every joint back toward home, then start the next episode
-            delta = np.clip(HOME_POSITION_DEG - joint_state, -MAX_DELTA_DEG, MAX_DELTA_DEG)
-            action_deg = np.clip(joint_state + delta, JOINT_LOWER_DEG, JOINT_UPPER_DEG).astype(np.float32)
-            self._reset_steps_remaining -= 1
-            if self._reset_steps_remaining <= 0:
-                self._resetting = False
-                logger.info(
-                    f"Reset complete — episode {self._episode_count + 1} starting  "
-                    f"explore_noise={self._explore_noise:.3f}"
-                )
-        elif self.mock:
+        if self.mock:
             # Echo current joints back — robot actively holds wherever it already is.
             action_deg = joint_state.copy()
             timed_actions = [TimedAction(
@@ -393,8 +354,34 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
             obs_dict = _build_obs_dict(joint_state, image_arrays, self.device)
             with self._lock:
                 self.runner.learner.eval()
+
+                # Close the transition opened by the previous learner.act() call.
+                # Doing this in GetActions keeps observation/action bookkeeping on
+                # one RPC thread instead of racing SendObservations against act().
+                if not self.eval_mode and self._prev_obs_dict is not None and self._transition_open:
+                    reward = torch.tensor([0.0], device=self.device)
+                    done = torch.tensor([0], dtype=torch.long, device=self.device)
+                    buffer_full = self._episode_steps >= self.runner.learner.storage.num_steps_per_env
+                    if not buffer_full:
+                        self.runner.learner.process_env_step(reward, done, {}, obs_dict)
+                        self._episode_steps += 1
+                    else:
+                        logger.debug(f"Buffer full at step {self._episode_steps} — skipping transition")
+                    self._transition_open = False
+
+                    with torch.no_grad():
+                        z  = self.runner.learner._encoder(self._prev_obs_dict)
+                        zn = self.runner.learner._encoder(obs_dict)
+                        disc_r = self.runner.learner._reward(z, zn).item()
+                    logger.info(
+                        f"[ep {self._episode_count + 1} step {self._episode_steps}]"
+                        f"  disc_reward={disc_r:.4f}"
+                    )
+
                 with torch.no_grad():
                     self.runner.learner.act(obs_dict)   # runs MPPI, fills _opt_controls
+                self._prev_obs_dict = obs_dict
+                self._transition_open = not self.eval_mode
 
             # Full planned trajectory: (num_timesteps, action_dim)
             traj_norm = self.runner.learner.planner._opt_controls[0].detach().cpu().numpy()
@@ -402,20 +389,37 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
             # Build action chunk — propagate joint positions so delta-clamping is consistent
             timed_actions = []
             current = joint_state.copy()
+            gripper_index = ACTION_DIM - 1
+            update_gripper = (
+                self._last_gripper_deg is None
+                or self._gripper_chunk_count % self.gripper_update_every == 0
+            )
             for t_offset, step_norm in enumerate(traj_norm):
-                noise = np.random.normal(0.0, self._explore_noise, size=step_norm.shape)
-                noisy_norm = np.clip(step_norm + noise, -1.0, 1.0)
-                step_deg = _to_degrees(noisy_norm, current, self.speed_scale)
+                action_norm = step_norm.copy()
+                if self.eval_mode and self._prev_action_norm is not None:
+                    action_norm = self._lpf_alpha * action_norm + (1 - self._lpf_alpha) * self._prev_action_norm
+                    action_norm = np.clip(action_norm, -1.0, 1.0)
+                if self.eval_mode:
+                    self._prev_action_norm = action_norm.copy()
+                step_deg = _to_degrees(action_norm, current, self.speed_scale)
+                if update_gripper:
+                    self._last_gripper_deg = float(step_deg[gripper_index])
+                else:
+                    step_deg[gripper_index] = self._last_gripper_deg
                 timed_actions.append(TimedAction(
                     timestamp=timestamp,
                     timestep=timestep + t_offset,
                     action=torch.tensor(step_deg, dtype=torch.float32),
                 ))
                 current = step_deg  # propagate so next step's delta is from the right base
+            self._gripper_chunk_count += 1
+
+            # Respect the client's requested chunk size so the observation rate
+            # stays in sync with the control rate (actions_per_chunk=1 → 1 obs/step).
+            timed_actions = timed_actions[:self._actions_per_chunk]
 
             logger.info(
-                f"act() → {len(timed_actions)}-step chunk  "
-                f"explore_noise={self._explore_noise:.3f}  "
+                f"act() → {len(timed_actions)}-step chunk (of {len(traj_norm)} planned)  "
                 f"elapsed={time.time()-t_act_start:.2f}s"
             )
 
@@ -451,17 +455,14 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
             self.runner.learner.planner.reset()
             self.runner.learner.storage.clear()
 
-        # Reset tracking outside the lock so cleanup always runs even if update() threw
         self._episode_steps = 0
         self._prev_obs_dict = None
-        self._explore_noise = max(self._explore_min, self._explore_noise * self._explore_decay)
+        self._transition_open = False
+        self._prev_action_norm = None
+        self._last_gripper_deg = None
+        self._gripper_chunk_count = 0
 
-        # Enter reset phase: GetActions will return home-position commands for RESET_HOLD_STEPS
-        self._resetting             = True
-        self._reset_steps_remaining = RESET_HOLD_STEPS
-        logger.info(
-            f"[ep {self._episode_count}] done — driving robot home for {RESET_HOLD_STEPS} steps"
-        )
+        logger.info(f"[ep {self._episode_count}] training done")
 
         if train_stats:
             logger.info(
@@ -508,10 +509,27 @@ def serve():
     parser.add_argument("--latent_dim",   type=int, default=512)
     parser.add_argument("--speed_scale",  type=float, default=0.3,
                         help="Scale max joint delta per step (0.0=frozen, 1.0=full speed). Default 0.3.")
+    parser.add_argument("--gripper_update_every", type=int, default=5,
+                        help="Only allow a new gripper command every N action chunks. "
+                             "Use 1 to update the gripper every chunk. Default 5.")
+    parser.add_argument("--load_checkpoint", default=None,
+                        help="Path to a .pt checkpoint (e.g. logs/so101_grpc/models/model_ep40.pt) "
+                             "to resume training from.")
+    parser.add_argument("--eval", action="store_true",
+                        help="Eval mode: load checkpoint, disable all training and exploration. "
+                             "Requires --load_checkpoint.")
+    parser.add_argument("--wandb", action="store_true",
+                        help="Enable Weights & Biases logging.")
+    parser.add_argument("--wandb_project", default="so101-mpail2",
+                        help="W&B project name (default: so101-mpail2).")
+    parser.add_argument("--wandb_run_name", default=None,
+                        help="W&B run name. Defaults to auto-generated name.")
     args = parser.parse_args()
 
     if not args.mock and args.demo_path is None:
         parser.error("--demo_path is required unless --mock is set.")
+    if args.eval and not args.load_checkpoint:
+        parser.error("--eval requires --load_checkpoint.")
 
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
 
@@ -534,6 +552,8 @@ def serve():
         demonstrations = torch.load(args.demo_path, map_location="cpu", weights_only=False)
         demo_keys = {OBS_KEY, CAM_KEY}
         demonstrations = {k: v.float() for k, v in demonstrations.items() if k in demo_keys}
+        if CAM_KEY not in demonstrations:
+            raise RuntimeError(f"Demo file missing '{CAM_KEY}'. Keys: {list(demonstrations)}")
         if OBS_KEY not in demonstrations:
             raise RuntimeError(f"Demo file missing '{OBS_KEY}'. Keys: {list(demonstrations)}")
 
@@ -554,14 +574,19 @@ def serve():
         print("Building runner...")
         env = make_so101_env(SO101RealEnvArgs(device=device, mock=True))
         encoder_cfg = MultiCoderConfig(coder_list=[
-            MultiCoderConfig.ProprioCoderConfig(obs_key=OBS_KEY, input_dim=STATE_DIM),
+            MultiCoderConfig.ProprioCoderConfig(obs_key=OBS_KEY, input_dim=STATE_DIM, output_dim=64),
             CNNCoderConfig(obs_key=CAM_KEY, H=CAM_H, W=CAM_W, C=CAM_C),
         ])
         planner_cfg = PlannerConfig(
             encoder_cfg=encoder_cfg,
             action_dim=ACTION_DIM,
             latent_dim=args.latent_dim,
-            sampling_cfg=PolicySamplingConfig(num_rollouts=args.num_rollouts),
+            sampling_cfg=PolicySamplingConfig(
+                num_rollouts=args.num_rollouts,
+                policy_proportion=0.05,  # 5% policy rollouts, 95% random — same as Franka
+                min_std=0.05,
+                max_std=2.0,
+            ),
             opt_iters=args.opt_iters,
             num_elites=args.num_elites,
         )
@@ -572,8 +597,21 @@ def serve():
             use_terminations=False,
             obs_normalizer_cfg=ObsNormalizerCfg(normalization_type="fixed"),
         )
+        if args.wandb:
+            import wandb as _wandb
+            _wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                config=vars(args),
+            )
+            logger.info(f"W&B run: {_wandb.run.url}")
+
         log_cfg = MPAIL2RunnerCfg.LogCfg(
-            log_dir=args.log_dir, checkpoint_every=999_999, no_wandb=True, video_interval=999_999,
+            log_dir=args.log_dir,
+            checkpoint_every=999_999,
+            no_wandb=not args.wandb,
+            logger="wandb" if args.wandb else None,
+            video_interval=999_999,
         )
         runner_cfg = MPAIL2RunnerCfg(
             learner_cfg=learner_cfg, log_cfg=log_cfg,
@@ -581,6 +619,10 @@ def serve():
         )
         os.makedirs(os.path.join(args.log_dir, "models"), exist_ok=True)
         runner = MPAIL2Runner(demonstrations=demonstrations, env=env, runner_cfg=runner_cfg, device=device)
+        if args.load_checkpoint:
+            print(f"Loading checkpoint from {args.load_checkpoint} ...")
+            runner.load(args.load_checkpoint)
+            print("  Checkpoint loaded.")
         runner.learner.eval()
         print(f"Runner ready  device={device}  obs_dim={STATE_DIM}  action_dim={ACTION_DIM}")
     else:
@@ -589,12 +631,21 @@ def serve():
     # Start server
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     services_pb2_grpc.add_AsyncInferenceServicer_to_server(
-        MPAILServicer(runner=runner, device=device, mock=args.mock, recorder=recorder, speed_scale=args.speed_scale),
+        MPAILServicer(
+            runner=runner,
+            device=device,
+            mock=args.mock,
+            recorder=recorder,
+            speed_scale=args.speed_scale,
+            eval_mode=args.eval,
+            gripper_update_every=args.gripper_update_every,
+        ),
         server,
     )
     server.add_insecure_port(f"[::]:{args.port}")
     server.start()
-    logger.info(f"gRPC server listening on port {args.port}  mode={'mock' if args.mock else 'rl'}")
+    mode = "mock" if args.mock else ("eval" if args.eval else "rl")
+    logger.info(f"gRPC server listening on port {args.port}  mode={mode}")
     logger.info("Waiting for robot_client.py ...")
     try:
         server.wait_for_termination()

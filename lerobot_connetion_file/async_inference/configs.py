@@ -14,10 +14,12 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Optional
 
 import torch
 
 from lerobot.robots.config import RobotConfig
+from lerobot.teleoperators.config import TeleoperatorConfig
 
 from .constants import (
     DEFAULT_FPS,
@@ -146,6 +148,53 @@ class RobotClientConfig:
     # Debug configuration
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
+    )
+
+    # ── Teleoperation (leader arm) ────────────────────────────────────────────
+    # When set, actions come from the leader arm instead of the policy server.
+    # Observations (including the teleop action) are still streamed to the server
+    # so planner_server.py can record them.  policy_type / pretrained_name_or_path
+    # are still required for the gRPC handshake but are ignored server-side.
+    teleop: Optional[TeleoperatorConfig] = field(
+        default=None,
+        metadata={"help": "Leader arm config. If set, enables teleoperation mode."},
+    )
+
+    # ── Home position / smooth reset (mirrors HTTP robot_server capabilities) ──
+    # Space-separated joint positions in degrees, matching robot.action_features order.
+    # Empty string = no reset (original behaviour).
+    home_joints: str = field(
+        default="",
+        metadata={"help": "Space-separated home joint positions in degrees. Empty = skip reset."},
+    )
+    # Number of linear interpolation steps when moving to home.
+    reset_steps: int = field(
+        default=80,
+        metadata={"help": "Interpolation steps when moving to home position (more = slower)."},
+    )
+    # Frequency of each interpolation step.
+    reset_hz: float = field(
+        default=50.0,
+        metadata={"help": "Hz of each interpolation step during reset."},
+    )
+
+    # ── Episode mode ──────────────────────────────────────────────────────────
+    # If set, the control loop stops after this many executed actions and resets.
+    # None = run indefinitely (original behaviour).
+    max_episode_steps: int | None = field(
+        default=None,
+        metadata={"help": "Actions per episode. None = run forever (original behaviour)."},
+    )
+    # Total number of episodes to run before exiting. None = run forever.
+    num_episodes: int | None = field(
+        default=None,
+        metadata={"help": "Number of episodes. None = run forever (original behaviour)."},
+    )
+    # Pause between episodes (after server training, before moving to home).
+    # During this window the robot holds still and no images are sent.
+    reset_pause_seconds: float = field(
+        default=0.0,
+        metadata={"help": "Seconds to pause between episodes for scene reset. Default 0 (no pause)."},
     )
 
     @property

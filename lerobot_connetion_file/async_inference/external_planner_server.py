@@ -251,6 +251,49 @@ class ExternalPlannerServer(services_pb2_grpc.AsyncInferenceServicer):
         actions_bytes = pickle.dumps(timed_actions)  # nosec
         return services_pb2.Actions(data=actions_bytes)
 
+    def Plan(self, request_iterator, context):  # noqa: N802
+        """Direct synchronous plan RPC: receive observation stream, call planner, return actions.
+
+        Unlike the SendObservations + GetActions two-step, this is a single blocking call:
+        the client streams observation chunks, the server forwards them to the HTTP planner,
+        and returns the resulting actions directly in the response.
+        """
+        received_bytes = receive_bytes_in_chunks(
+            request_iterator, None, self.shutdown_event, logger
+        )
+        if not received_bytes:
+            return services_pb2.Actions(data=b"")
+
+        timed_obs: TimedObservation = pickle.loads(received_bytes)  # nosec
+        logger.debug(f"Plan RPC: observation #{timed_obs.get_timestep()} (must_go={timed_obs.must_go})")
+
+        payload = _timed_obs_to_json(timed_obs, include_images=self.include_images)
+
+        try:
+            t0 = time.perf_counter()
+            response = requests.post(
+                self.planner_url,
+                data=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+                timeout=self.http_timeout,
+            )
+            response.raise_for_status()
+            elapsed = time.perf_counter() - t0
+            logger.info(f"Plan RPC: planner responded in {elapsed * 1000:.1f}ms for obs #{timed_obs.get_timestep()}")
+        except requests.RequestException as e:
+            logger.error(f"Plan RPC: planner request failed: {e}")
+            return services_pb2.Actions(data=b"")
+
+        timed_actions = _json_to_timed_actions(
+            response.json(),
+            base_timestep=timed_obs.get_timestep(),
+            base_timestamp=timed_obs.get_timestamp(),
+            environment_dt=self.environment_dt,
+        )
+
+        actions_bytes = pickle.dumps(timed_actions)  # nosec
+        return services_pb2.Actions(data=actions_bytes)
+
     def stop(self):
         self.shutdown_event.set()
         logger.info("ExternalPlannerServer stopped.")

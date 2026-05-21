@@ -23,8 +23,9 @@ import uvicorn
 from mpail2.runner import MPAIL2Runner
 from mpail2.configs.cfgs import MPAIL2RunnerCfg
 from mpail2.configs.defs import (
-    MLPCoderConfig, PlannerConfig, PolicySamplingConfig, LearnerConfig,
+    MLPCoderConfig, MultiCoderConfig, CNNCoderConfig, PlannerConfig, PolicySamplingConfig, LearnerConfig,
 )
+from mpail2.configs.cfgs import ObsNormalizerCfg
 from mpail2.envs.real.so101 import (
     SO101RealEnvArgs,
     make_so101_env,
@@ -36,6 +37,7 @@ from mpail2.envs.real.so101 import (
     JOINT_UPPER_DEG,
     MAX_DELTA_DEG,
 )
+from mpail2.envs.real.so101.robot_limits import CAM_KEY, CAM_H, CAM_W, CAM_C
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG  –  edit to match your setup
@@ -85,7 +87,12 @@ print(f"  {OBS_KEY}: {tuple(demonstrations[OBS_KEY].shape)}")
 # ─────────────────────────────────────────────────────────────────────────────
 print("Building MPAIL2 runner...")
 
-encoder_cfg  = MLPCoderConfig(obs_key=OBS_KEY, input_dim=STATE_DIM, output_dim=LATENT_DIM)
+encoder_cfg  = MultiCoderConfig(
+    coder_list=[
+        MultiCoderConfig.ProprioCoderConfig(obs_key=OBS_KEY, input_dim=STATE_DIM),
+        CNNCoderConfig(obs_key=CAM_KEY, H=CAM_H, W=CAM_W, C=CAM_C),
+    ],
+)
 sampling_cfg = PolicySamplingConfig(num_rollouts=NUM_ROLLOUTS)
 planner_cfg  = PlannerConfig(
     encoder_cfg=encoder_cfg,
@@ -97,9 +104,10 @@ planner_cfg  = PlannerConfig(
 )
 learner_cfg = LearnerConfig(
     planner_cfg=planner_cfg,
-    replay_size=100_000,
+    replay_size=10_000,       # reduced: image replay buffers are memory-heavy
     replay_batch_size=256,
     use_terminations=False,
+    obs_normalizer_cfg=ObsNormalizerCfg(normalization_type="cam_only"),
 )
 log_cfg = MPAIL2RunnerCfg.LogCfg(
     log_dir=LOG_DIR, checkpoint_every=999_999, no_wandb=True, video_interval=999_999,
@@ -139,19 +147,22 @@ app = FastAPI(title="MPAIL2 SO-101 Policy Server")
 
 
 class ObsRequest(BaseModel):
-    obs: list[float]    # flat, length = STATE_DIM
+    obs:    list[float]        # flat joint positions, length = STATE_DIM
+    camera: list | None = None # (CAM_H, CAM_W, CAM_C) nested list, uint8 or float [0,1]
 
 
 class ActionResponse(BaseModel):
-    action: list[float] # flat, length = ACTION_DIM
+    action: list[float]        # flat, length = ACTION_DIM
 
 
 class TransitionRequest(BaseModel):
-    obs:      list[float]
-    action:   list[float]
-    reward:   float
-    next_obs: list[float]
-    done:     bool
+    obs:        list[float]
+    action:     list[float]
+    reward:     float
+    next_obs:   list[float]
+    done:       bool
+    camera:     list | None = None
+    next_camera: list | None = None
 
 
 @app.get("/health")
@@ -171,6 +182,14 @@ def health():
 _HALF_RANGE = (JOINT_UPPER_DEG - JOINT_LOWER_DEG) / 2.0  # precomputed once
 
 
+def _cam_to_tensor(camera_list) -> torch.Tensor:
+    """Convert nested list (H, W, C) uint8 or float → (1, H, W, C) float32 [0, 1]."""
+    arr = np.array(camera_list, dtype=np.float32)
+    if arr.max() > 1.0:        # uint8 input
+        arr /= 255.0
+    return torch.from_numpy(arr.reshape(1, CAM_H, CAM_W, CAM_C)).to(DEVICE)
+
+
 @app.post("/act", response_model=ActionResponse)
 def act(req: ObsRequest):
     """Return a joint-position command in degrees for the given observation.
@@ -184,6 +203,8 @@ def act(req: ObsRequest):
     """
     obs_t = torch.tensor(req.obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
     obs_dict = {OBS_KEY: obs_t}
+    if req.camera is not None:
+        obs_dict[CAM_KEY] = _cam_to_tensor(req.camera)
     with torch.no_grad():
         action_norm = runner.learner.act(obs_dict).squeeze(0).cpu().numpy()  # (ACTION_DIM,)
 
@@ -245,7 +266,9 @@ def _parse_step_done_body(body: dict) -> tuple:
 
     reward = float(body.get("reward", 0.0))
     done   = bool(body.get("done", False))
-    return obs, next_obs, reward, done
+    camera      = body.get("camera", None)
+    next_camera = body.get("next_camera", None)
+    return obs, next_obs, reward, done, camera, next_camera
 
 
 @app.post("/step_done")
@@ -258,7 +281,7 @@ async def step_done(request: Request):
 
     body = await request.json()
     try:
-        obs_list, next_obs_list, reward_val, done_val = _parse_step_done_body(body)
+        obs_list, next_obs_list, reward_val, done_val, camera, next_camera = _parse_step_done_body(body)
     except Exception as exc:
         print(f"[step_done] parse error: {exc}\n  body keys: {list(body.keys())}")
         print(f"  full body: {body}")
@@ -266,8 +289,13 @@ async def step_done(request: Request):
 
     obs_dict      = {OBS_KEY: torch.tensor(obs_list,      dtype=torch.float32, device=DEVICE).unsqueeze(0)}
     next_obs_dict = {OBS_KEY: torch.tensor(next_obs_list, dtype=torch.float32, device=DEVICE).unsqueeze(0)}
-    reward        = torch.tensor([reward_val], dtype=torch.float32, device=DEVICE)
-    done          = torch.tensor([int(done_val)], dtype=torch.long, device=DEVICE)
+    if camera is not None:
+        obs_dict[CAM_KEY]      = _cam_to_tensor(camera)
+    if next_camera is not None:
+        next_obs_dict[CAM_KEY] = _cam_to_tensor(next_camera)
+
+    reward = torch.tensor([reward_val], dtype=torch.float32, device=DEVICE)
+    done   = torch.tensor([int(done_val)], dtype=torch.long, device=DEVICE)
 
     runner.learner.process_env_step(reward, done, {}, next_obs_dict)
     _episode_steps += 1

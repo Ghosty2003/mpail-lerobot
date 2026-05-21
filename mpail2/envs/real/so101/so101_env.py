@@ -54,6 +54,10 @@ from gymnasium import spaces
 
 from .robot_limits import (
     ACTION_DIM,
+    CAM_C,
+    CAM_H,
+    CAM_KEY,
+    CAM_W,
     CONTROL_FREQUENCY_HZ,
     DEFAULT_ROBOT_HOST,
     DEFAULT_ROBOT_PORT,
@@ -113,7 +117,12 @@ class SO101RobotEnv(gym.Env):
                 high=np.tile(JOINT_UPPER_DEG, (1, 1)),
                 shape=(1, STATE_DIM),
                 dtype=np.float32,
-            )
+            ),
+            CAM_KEY: spaces.Box(
+                low=0.0, high=1.0,
+                shape=(1, CAM_H, CAM_W, CAM_C),
+                dtype=np.float32,
+            ),
         })
         # Actions are normalised joint targets in [-1, 1] (planner outputs tanh)
         self.action_space = spaces.Box(
@@ -126,6 +135,8 @@ class SO101RobotEnv(gym.Env):
             print("[SO101RobotEnv] Running in mock mode — no HTTP calls will be made.")
         else:
             print(f"[SO101RobotEnv] Connecting to robot server at {host}:{port}")
+
+    _mock_cam: np.ndarray = None  # lazily allocated in mock mode
 
     # ─── HTTP helpers ──────────────────────────────────────────────────────────
 
@@ -155,6 +166,25 @@ class SO101RobotEnv(gym.Env):
             )
         except Exception as exc:
             print(f"[SO101RobotEnv] /step failed: {exc}")
+
+    def _get_camera(self) -> np.ndarray:
+        """Return a (CAM_H, CAM_W, CAM_C) float32 image in [0, 1].
+
+        The robot HTTP server must expose:
+            GET /camera → {"image": [[[r,g,b], ...], ...]}  (CAM_H × CAM_W × 3 uint8)
+        """
+        if self.mock:
+            if self._mock_cam is None:
+                self._mock_cam = np.zeros((CAM_H, CAM_W, CAM_C), dtype=np.float32)
+            return self._mock_cam
+        try:
+            r = _requests.get(self._url("/camera"), timeout=2.0)
+            r.raise_for_status()
+            img = np.array(r.json()["image"], dtype=np.float32) / 255.0
+            return img.reshape(CAM_H, CAM_W, CAM_C)
+        except Exception as exc:
+            print(f"[SO101RobotEnv] /camera failed: {exc} — returning blank frame")
+            return np.zeros((CAM_H, CAM_W, CAM_C), dtype=np.float32)
 
     def _send_reset(self) -> None:
         if self.mock:
@@ -199,7 +229,11 @@ class SO101RobotEnv(gym.Env):
     # ─── Gymnasium API ─────────────────────────────────────────────────────────
 
     def _make_obs(self, joints: np.ndarray) -> Dict[str, np.ndarray]:
-        return {OBS_KEY: joints.reshape(1, STATE_DIM).astype(np.float32)}
+        cam = self._get_camera()
+        return {
+            OBS_KEY: joints.reshape(1, STATE_DIM).astype(np.float32),
+            CAM_KEY: cam.reshape(1, CAM_H, CAM_W, CAM_C),
+        }
 
     def reset(
         self,

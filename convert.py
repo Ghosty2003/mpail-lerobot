@@ -5,6 +5,7 @@ Usage:
     python convert.py --dirs raw_demos2        # same
     python convert.py --dirs raw_demos raw_demos2 raw_demos3   # all demos
     python convert.py --out my_demos.pt        # custom output path
+    python convert.py --img_size 84            # resize cameras to 84x84 (default)
 """
 
 import argparse
@@ -12,9 +13,35 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+
+_IMG_KEY_PREFIXES = ("observation.images.",)
 
 
-def convert(source_dirs: list[str], out_path: str) -> None:
+def _normalize_key(key: str) -> str:
+    """Strip lerobot image key prefix: 'observation.images.cam' → 'cam'."""
+    for prefix in _IMG_KEY_PREFIXES:
+        if key.startswith(prefix):
+            return key[len(prefix):]
+    return key
+
+
+def _resize_cam(tensor: torch.Tensor, img_size: int) -> torch.Tensor:
+    """Resize camera tensor (N, 2, H, W, C) → (N, 2, img_size, img_size, C)."""
+    N, two, H, W, C = tensor.shape
+    if H == img_size and W == img_size:
+        return tensor
+    # (N,2,H,W,C) → (N*2, C, H, W) for interpolate
+    t = tensor.reshape(N * 2, H, W, C).permute(0, 3, 1, 2).float()
+    if t.max() > 1.0:
+        t = t / 255.0
+    t = F.interpolate(t, size=(img_size, img_size), mode="bilinear", align_corners=False)
+    # (N*2, C, img_size, img_size) → (N, 2, img_size, img_size, C)
+    t = t.permute(0, 2, 3, 1).reshape(N, 2, img_size, img_size, C)
+    return t
+
+
+def convert(source_dirs: list[str], out_path: str, img_size: int = 84, state_dim: int | None = None) -> None:
     all_data: dict = {}
     total_files = 0
 
@@ -29,8 +56,12 @@ def convert(source_dirs: list[str], out_path: str) -> None:
             continue
         for npz_file in npz_files:
             d = np.load(str(npz_file), allow_pickle=True)
-            for key in d.files:
-                arr = torch.from_numpy(d[key].astype(np.float32))
+            for raw_key in d.files:
+                key = _normalize_key(raw_key)
+                arr = torch.from_numpy(d[raw_key].astype(np.float32))
+                # Resize cameras immediately to avoid holding 480×640 frames in RAM
+                if arr.dim() == 5:
+                    arr = _resize_cam(arr, img_size)
                 all_data.setdefault(key, []).append(arr)
             total_files += 1
             print(f"  loaded {npz_file}  keys={list(d.files)}")
@@ -49,6 +80,13 @@ def convert(source_dirs: list[str], out_path: str) -> None:
             "Keys found: " + str(list(merged.keys()))
         )
 
+    # Trim state vector if it has extra dims (e.g. follower+leader concatenated → follower only)
+    state_key = "observation.state"
+    if state_dim is not None and state_key in demos and demos[state_key].shape[-1] != state_dim:
+        before = demos[state_key].shape[-1]
+        demos[state_key] = demos[state_key][..., :state_dim]
+        print(f"  trimmed {state_key}: dim {before} → {state_dim}")
+
     torch.save(demos, out_path)
     print(f"\nSaved {out_path}")
     print(f"  Source files : {total_files}")
@@ -66,5 +104,13 @@ if __name__ == "__main__":
         "--out", default="raw_demos2_master.pt",
         help="Output .pt file path (default: raw_demos2_master.pt)",
     )
+    parser.add_argument(
+        "--img_size", type=int, default=84,
+        help="Resize camera images to this square size (default: 84)",
+    )
+    parser.add_argument(
+        "--state_dim", type=int, default=None,
+        help="Trim observation.state to this many dims (e.g. 6 if data has follower+leader=12)",
+    )
     args = parser.parse_args()
-    convert(args.dirs, args.out)
+    convert(args.dirs, args.out, img_size=args.img_size, state_dim=args.state_dim)

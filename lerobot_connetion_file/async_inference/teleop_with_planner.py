@@ -71,7 +71,13 @@ class TeleopWithPlannerConfig:
     include_images: bool = False
 
 
-def _build_payload(raw_obs: dict, timestep: int, task: str, include_images: bool) -> dict:
+def _build_payload(
+    raw_obs: dict,
+    timestep: int,
+    task: str,
+    include_images: bool,
+    teleop_action: dict | None = None,
+) -> dict:
     observation_payload: dict = {"task": task}
     for key, value in raw_obs.items():
         if isinstance(value, np.ndarray):
@@ -83,12 +89,17 @@ def _build_payload(raw_obs: dict, timestep: int, task: str, include_images: bool
         else:
             observation_payload[key] = value
 
-    return {
+    payload: dict = {
         "timestep": timestep,
         "timestamp": time.time(),
         "must_go": False,
         "observation": observation_payload,
     }
+    # Include actual teleop action so planner_server records what the human did,
+    # not the planner's own prediction.
+    if teleop_action is not None:
+        payload["teleop_action"] = [float(v) for v in teleop_action.values()]
+    return payload
 
 
 def _post_to_planner(url: str, payload: dict, timeout: float) -> None:
@@ -143,7 +154,7 @@ def main(cfg: TeleopWithPlannerConfig):
             robot.send_action(action)
 
             # 3. Fire-and-forget POST to the planner (non-blocking)
-            payload = _build_payload(raw_obs, timestep, cfg.task, cfg.include_images)
+            payload = _build_payload(raw_obs, timestep, cfg.task, cfg.include_images, action)
             threading.Thread(
                 target=_post_to_planner,
                 args=(cfg.planner_url, payload, cfg.http_timeout),
