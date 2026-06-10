@@ -14,7 +14,7 @@ The following settings MUST be set for each task:
 
 #### SHARED CONSTANTS ####
 OPT = "adam"
-LR = 1e-4
+LR = 2e-4
 HORIZON = 7
 OPT_ITERS = 5
 GAMMA = 0.99
@@ -154,7 +154,7 @@ class PolicySamplingConfig(cfgs.PolicySamplingCfg):
     num_timesteps: int = HORIZON
     policy_proportion: float = 0.05
     min_std: float = 0.05
-    max_std: float = 2.0
+    max_std: float = 3.0
     model_kwargs: dict = field(default_factory=lambda: {
         **MODEL_KWARGS,
     })
@@ -172,7 +172,7 @@ class PlannerConfig(cfgs.PlannerCfg):
 
     latent_dim: int = 512
     num_elites: int = 64
-    temperature: float = 2.0
+    temperature: float = 1.0
     opt_iters: int = OPT_ITERS
 
     reward_cfg: RewardConfig = field(default_factory=RewardConfig)
@@ -201,7 +201,7 @@ class ValueLearnerConfig(cfgs.ValueLearnerCfg):
 
     max_grad_norm: float = 5.0
 
-    polyak_tau: float = 0.01
+    polyak_tau: float = 0.05
 
 @dataclass(kw_only=True)
 class RewardLearnerConfig(cfgs.RewardLearnerCfg):
@@ -210,7 +210,7 @@ class RewardLearnerConfig(cfgs.RewardLearnerCfg):
 
     opt_params: dict = field(default_factory=lambda: OPT_PARAMS)
 
-    gp_coeff: float = 0.1
+    gp_coeff: float = 10.0
 
     gp_target_gradient: float = 1.0
 
@@ -223,7 +223,7 @@ class PolicyLearnerConfig(cfgs.PolicyLearnerCfg):
 
     max_grad_norm: float = 1.0
 
-    target_entropy: float = -3.0  # -ACTION_DIM
+    target_entropy: float = -2.0  # encourage exploration; -ACTION_DIM=-5 is too conservative
 
     alpha_lr: float = LR
 
@@ -236,7 +236,7 @@ class DynamicsLearnerConfig(cfgs.DynamicsLearnerCfg):
 
     opt_params: dict = field(default_factory=lambda: OPT_PARAMS)
 
-    enc_lr_scale: float = 0.1
+    enc_lr_scale: float = 0.02
 
     rho: float = 0.95
 
@@ -249,23 +249,23 @@ class LearnerConfig(cfgs.MPAIL2LearnerCfg):
     planner_cfg: cfgs.PlannerCfg = MISSING
 
     # Training parameters
-    replay_ratio: float = 1.0
+    replay_ratio: float = 0.5
 
     # Replay buffer settings
     replay_size: int = 100_000
-    replay_batch_size: int = 256
+    replay_batch_size: int = 128
 
     # Loss horizon for trajectory-based updates
     loss_horizon: int = HORIZON  # Match num_timesteps in sampling_cfg
 
     # Dynamics - ENABLED for training
-    dynamics_learner_cfg: cfgs.DynamicsLearnerCfg = DynamicsLearnerConfig()
+    dynamics_learner_cfg: cfgs.DynamicsLearnerCfg = field(default_factory=DynamicsLearnerConfig)
 
     # Reward (adversarial training)
-    reward_learner_cfg: cfgs.RewardLearnerCfg = RewardLearnerConfig()
+    reward_learner_cfg: cfgs.RewardLearnerCfg = field(default_factory=RewardLearnerConfig)
 
     # Value
-    value_learner_cfg: cfgs.ValueLearnerCfg = ValueLearnerConfig()
+    value_learner_cfg: cfgs.ValueLearnerCfg = field(default_factory=ValueLearnerConfig)
 
     # Policy Learner
-    policy_learner_cfg: cfgs.PolicyLearnerCfg = PolicyLearnerConfig()
+    policy_learner_cfg: cfgs.PolicyLearnerCfg = field(default_factory=PolicyLearnerConfig)

@@ -24,7 +24,7 @@ Robot client (lerobot env, either mode):
         --server_address=127.0.0.1:8080 \\
         --task="pick up the cup" \\
         --actions_per_chunk=1 \\
-        --max_episode_steps=100 \
+        --max_episode_steps=300 \
         --reset_pause_seconds=10
 """
 
@@ -58,15 +58,57 @@ warnings.filterwarnings("ignore", message=".*pow_by_natural.*")
 from transport import services_pb2, services_pb2_grpc
 
 from mpail2.envs.real.so101 import (
-    SO101RealEnvArgs, make_so101_env, OBS_KEY, STATE_DIM, ACTION_DIM,
-    HOME_POSITION_DEG, JOINT_LOWER_DEG, JOINT_UPPER_DEG, MAX_DELTA_DEG,
+    SO101RealEnvArgs, make_so101_env, OBS_KEY, STATE_DIM, ACTION_DIM, EE_PROPRIO_DIM,
+    HOME_POSITION_DEG,
 )
-from mpail2.envs.real.so101.robot_limits import CAM_KEY, CAM_H, CAM_W, CAM_C
+from mpail2.envs.real.so101.robot_limits import (
+    CAM_KEY, CAM_H, CAM_W, CAM_C,
+    CAM2_KEY, CAM2_H, CAM2_W, CAM2_C,
+    EE_LOWER_M, EE_UPPER_M, MAX_DELTA_M,
+    HOME_WRIST_ROLL_DEG, WRIST_ROLL_HALF_RANGE,
+    HOME_GRIPPER_DEG, GRIPPER_HALF_RANGE,
+    GRIPPER_LOWER_DEG, GRIPPER_UPPER_DEG,
+    JOINT_LOWER_DEG, JOINT_UPPER_DEG,
+)
+from ik_utils import fk as _fk, fk_pose as _fk_pose, ik as _ik
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("grpc_policy_server")
 
-_HALF_RANGE = (JOINT_UPPER_DEG - JOINT_LOWER_DEG) / 2.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAMERA DISPLAY — live OpenCV window updated from a background thread
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CAM_SAVE_PATH = "cameras_latest.png"
+
+def _update_camera_display(image_arrays: dict) -> None:
+    """Save both camera images side-by-side to cameras_latest.png.
+
+    Open this file in VSCode — it auto-refreshes as the file updates.
+    Layout: RealSense (cam2) on the left, wrist cam (cam) on the right.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return
+    frames = []
+    for key in ("cam2", "cam"):
+        img = image_arrays.get(key)
+        if img is None:
+            continue
+        img = np.array(img, dtype=np.float32)
+        if img.max() > 1.0:
+            img = img / 255.0
+        img_u8 = (img * 255).clip(0, 255).astype(np.uint8)
+        if img_u8.shape[2] == 3:
+            img_u8 = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGR)
+        img_u8 = cv2.resize(img_u8, (320, 240))
+        frames.append(img_u8)
+    if not frames:
+        return
+    composed = np.concatenate(frames, axis=1)
+    cv2.imwrite(_CAM_SAVE_PATH, composed)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,7 +164,7 @@ def _parse_raw_obs(raw_obs: dict) -> tuple[np.ndarray, dict]:
     joint_vals = []
     image_arrays = {}
     for key, value in raw_obs.items():
-        if key == "task":
+        if key in ("task", "teleop_action"):
             continue
         arr = np.array(value, dtype=np.float32)
         if arr.ndim == 3:
@@ -135,8 +177,18 @@ def _parse_raw_obs(raw_obs: dict) -> tuple[np.ndarray, dict]:
     return np.array(joint_vals, dtype=np.float32), image_arrays
 
 
+def _joints_to_ee_proprio(joint_state: np.ndarray) -> np.ndarray:
+    """Convert 6-dim joint state (degrees) to 13-dim proprioception.
+
+    Returns [ee_x, ee_y, ee_z, qx, qy, qz, qw, j0..j5] — matches Franka convention.
+    """
+    xyz, quat = _fk_pose(joint_state[:5])              # xyz (3,), quat [x,y,z,w] (4,)
+    return np.concatenate([xyz, quat, joint_state], dtype=np.float32)  # (13,)
+
+
 def _build_obs_dict(joint_state: np.ndarray, image_arrays: dict, device: str) -> dict:
-    result = {OBS_KEY: torch.from_numpy(joint_state).unsqueeze(0).to(device)}
+    ee_proprio = _joints_to_ee_proprio(joint_state)
+    result = {OBS_KEY: torch.from_numpy(ee_proprio).unsqueeze(0).to(device)}
     for cam_name, img_arr in image_arrays.items():
         img = img_arr.astype(np.float32)
         if img.max() > 1.0:
@@ -149,13 +201,84 @@ def _build_obs_dict(joint_state: np.ndarray, image_arrays: dict, device: str) ->
     return result
 
 
-def _to_degrees(action_norm: np.ndarray, current_joints: np.ndarray, speed_scale: float = 1.0) -> np.ndarray:
-    max_delta = MAX_DELTA_DEG * speed_scale
-    target = HOME_POSITION_DEG + action_norm * _HALF_RANGE
-    delta  = np.clip(target - current_joints, -max_delta, max_delta)
-    delta[current_joints >= JOINT_UPPER_DEG] = np.minimum(delta[current_joints >= JOINT_UPPER_DEG], 0.0)
-    delta[current_joints <= JOINT_LOWER_DEG] = np.maximum(delta[current_joints <= JOINT_LOWER_DEG], 0.0)
-    return np.clip(current_joints + delta, JOINT_LOWER_DEG, JOINT_UPPER_DEG).astype(np.float32)
+def _project_action_to_bounds(
+    action_norm: np.ndarray,
+    current_ee: np.ndarray,
+    current_arm_deg: np.ndarray,
+    current_gripper_deg: float,
+) -> np.ndarray:
+    """Zero out action components that push against a hard boundary (same as Franka).
+
+    EE xyz (indices 0-2): zeroed when at workspace bounds.
+    Wrist roll (index 3): zeroed when at joint limits.
+    Gripper (index 4): zeroed at limits.
+    """
+    projected = action_norm.copy()
+
+    # EE xyz axes: zero out push against boundary (same as Franka)
+    for dim in range(3):
+        if current_ee[dim] <= float(EE_LOWER_M[dim]) and projected[dim] < 0.0:
+            projected[dim] = 0.0
+        elif current_ee[dim] >= float(EE_UPPER_M[dim]) and projected[dim] > 0.0:
+            projected[dim] = 0.0
+
+    # Wrist roll: zero at joint limits
+    wr = current_arm_deg[4]
+    if wr <= float(JOINT_LOWER_DEG[4]) and projected[3] < 0.0:
+        projected[3] = 0.0
+    elif wr >= float(JOINT_UPPER_DEG[4]) and projected[3] > 0.0:
+        projected[3] = 0.0
+
+    # Gripper: zero at limits (can't meaningfully reflect open/close)
+    g = current_gripper_deg if current_gripper_deg is not None else float(HOME_GRIPPER_DEG)
+    if g <= float(GRIPPER_LOWER_DEG) and projected[4] < 0.0:
+        projected[4] = 0.0
+    elif g >= float(GRIPPER_UPPER_DEG) and projected[4] > 0.0:
+        projected[4] = 0.0
+
+    return projected
+
+
+def _action_norm_to_joints(
+    action_norm: np.ndarray,        # shape (5,): [x_n, y_n, z_n, wrist_roll_n, gripper_n] in [-1,1]
+    current_ee: np.ndarray,         # current EE xyz (m), delta base position
+    current_arm_deg: np.ndarray,    # current 5 arm joints (deg), IK warm-start
+    speed_scale: float = 1.0,
+    current_gripper_deg: float = None,  # current gripper angle (deg), delta base
+) -> tuple[np.ndarray, np.ndarray]:
+    """Decode a 5-dim normalised action to 6 joint-degree targets via IK.
+
+    Applies boundary projection first: components blocked by workspace / joint limits
+    are zeroed so the robot never pushes against a wall.
+
+    Returns (joints_deg shape (6,), effective_action_norm shape (5,)).
+    effective_action_norm is the post-projection action that should be stored in the
+    replay buffer so the dynamics model learns actual boundary behaviour.
+    """
+    # ── Project to feasible region first ──
+    action_norm = _project_action_to_bounds(
+        action_norm, current_ee, current_arm_deg, current_gripper_deg
+    )
+
+    # ── Arm xyz — delta ──
+    max_d = float(MAX_DELTA_M * speed_scale)
+    delta_xyz = action_norm[:3].astype(np.float32) * max_d
+    target_xyz = np.clip(current_ee + delta_xyz, EE_LOWER_M, EE_UPPER_M)
+
+    arm_deg = _ik(target_xyz, initial_arm_deg=current_arm_deg)
+    arm_deg = np.clip(arm_deg, JOINT_LOWER_DEG[:5], JOINT_UPPER_DEG[:5])
+
+    # ── Wrist roll — delta ──
+    wrist_delta_deg = float(action_norm[3]) * float(WRIST_ROLL_HALF_RANGE) * speed_scale
+    arm_deg[4] = float(np.clip(current_arm_deg[4] + wrist_delta_deg,
+                               JOINT_LOWER_DEG[4], JOINT_UPPER_DEG[4]))
+
+    # ── Gripper — delta ──
+    base_g = float(current_gripper_deg) if current_gripper_deg is not None else HOME_GRIPPER_DEG
+    gripper_delta_deg = float(action_norm[4]) * float(GRIPPER_HALF_RANGE) * speed_scale
+    gripper_deg = float(np.clip(base_g + gripper_delta_deg, GRIPPER_LOWER_DEG, GRIPPER_UPPER_DEG))
+
+    return np.append(arm_deg, gripper_deg).astype(np.float32), action_norm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -243,6 +366,10 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
         speed_scale: float = 1.0,
         eval_mode: bool = False,
         gripper_update_every: int = 5,
+        lpf_alpha: float = 0.6,
+        start_episode: int = 0,
+        max_episode_steps: int = 200,
+        show_cameras: bool = False,
     ):
         self.runner      = runner      # None in mock mode
         self.device      = device
@@ -251,6 +378,10 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
         self.recorder    = recorder
         self.speed_scale = speed_scale
         self.gripper_update_every = max(1, gripper_update_every)
+        self.max_episode_steps = max_episode_steps
+        self.show_cameras = show_cameras
+        if show_cameras:
+            logger.info(f"[cameras] Saving live frames to {_CAM_SAVE_PATH} — open in VSCode to watch")
 
         self._lock = threading.Lock()
         self._obs_queue: Queue = Queue(maxsize=1)
@@ -259,24 +390,29 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
         self._prev_obs_dict  = None
         self._transition_open = False  # set after learner.act(), cleared after process_env_step
         self._episode_steps  = 0
-        self._episode_count  = 0
+        self._episode_count  = start_episode
         self._prev_timestep  = -1
         self._recording_paused = False   # True while waiting for Enter between episodes
         self._actions_per_chunk = 1      # updated from SendPolicyInstructions
 
         # Exploration is handled by MPPI sampling (policy_proportion=0.05, max_std=2.0)
         # — same as Franka. No episode-level noise decay needed.
-        self._prev_action_norm = None
-        self._lpf_alpha        = 0.6   # EMA weight on new action (lower = smoother, more lag)
-        self._last_gripper_deg = None
+        self._prev_action_norm  = None
+        self._lpf_alpha         = lpf_alpha  # EMA weight on new action (lower = smoother, more lag)
+        self._last_gripper_deg  = None
+        self._prev_gripper_norm = None       # separate LPF state for gripper (only steps when gripper updates)
         self._gripper_chunk_count = 0
+        self._disc_rewards_this_ep: List[float] = []
 
     def Ready(self, request, context):
-        # Train synchronously on the just-completed episode.
-        # The client blocks on this call, so no observations arrive during training.
-        if not self.mock and not self.eval_mode and self._episode_steps > 0:
-            logger.info(f"Ready: training on episode {self._episode_count + 1} ({self._episode_steps} steps)...")
-            self._on_episode_end()
+        # Kick off end-of-episode work (save / train) in a background thread so the
+        # client gets this response immediately and the arm can keep moving.
+        # _recording_paused is set to True inside _on_episode_end() before any slow
+        # work starts, so incoming observations are discarded until the next episode
+        # is ready to record.
+        if self._episode_steps > 0 and not self.eval_mode:
+            logger.info(f"Ready: starting episode-end work in background (ep {self._episode_count + 1}, {self._episode_steps} steps)...")
+            threading.Thread(target=self._on_episode_end, daemon=True).start()
         logger.info(f"Robot client connected: {context.peer()}")
         self.shutdown_event.clear()
         self._obs_queue = Queue(maxsize=1)
@@ -304,9 +440,15 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
                 if state == services_pb2.TransferState.TRANSFER_END:
                     break
             data = buf.getvalue()
-            logger.info(f"SendObservations: received {n_chunks} chunk(s), {len(data)} bytes")
+            logger.debug(f"SendObservations: received {n_chunks} chunk(s), {len(data)} bytes")
         except Exception as e:
             logger.exception(f"SendObservations chunk read error: {e}")
+            return services_pb2.Empty()
+
+        # While paused between episodes, discard immediately — arm movement is
+        # handled client-side (leader→follower), so we don't need to queue or record.
+        if self._recording_paused:
+            logger.debug("SendObservations: discarded (recording paused)")
             return services_pb2.Empty()
 
         try:
@@ -319,10 +461,22 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
             timestep = timed_obs.get_timestep()
             joint_state, image_arrays = _parse_raw_obs(timed_obs.get_observation())
 
+            if self._episode_steps == 0 and self._prev_obs_dict is None:
+                cam_info = {k: v.shape for k, v in image_arrays.items()}
+                logger.info(f"[obs check] joints={joint_state.shape} cameras={cam_info}")
+
+            if self.show_cameras:
+                _update_camera_display(image_arrays)
+
+            if self._episode_steps % 10 == 0:
+                from mpail2.envs.real.so101.robot_limits import JOINT_NAMES
+                joint_str = "  ".join(f"{n}={v:.2f}" for n, v in zip(JOINT_NAMES, joint_state))
+                logger.info(f"[joints] {joint_str}")
+
             self._prev_timestep = timestep
 
-            # Record demo transition (skipped while paused between episodes)
-            if self.recorder is not None and not self._recording_paused:
+            # Record demo transition
+            if self.recorder is not None:
                 self.recorder.record(joint_state, image_arrays)
 
             # Push to obs queue so GetActions can respond
@@ -361,7 +515,7 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
                 if not self.eval_mode and self._prev_obs_dict is not None and self._transition_open:
                     reward = torch.tensor([0.0], device=self.device)
                     done = torch.tensor([0], dtype=torch.long, device=self.device)
-                    buffer_full = self._episode_steps >= self.runner.learner.storage.num_steps_per_env
+                    buffer_full = self._episode_steps >= min(self.max_episode_steps, self.runner.learner.storage.num_steps_per_env)
                     if not buffer_full:
                         self.runner.learner.process_env_step(reward, done, {}, obs_dict)
                         self._episode_steps += 1
@@ -373,6 +527,7 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
                         z  = self.runner.learner._encoder(self._prev_obs_dict)
                         zn = self.runner.learner._encoder(obs_dict)
                         disc_r = self.runner.learner._reward(z, zn).item()
+                    self._disc_rewards_this_ep.append(disc_r)
                     logger.info(
                         f"[ep {self._episode_count + 1} step {self._episode_steps}]"
                         f"  disc_reward={disc_r:.4f}"
@@ -383,34 +538,86 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
                 self._prev_obs_dict = obs_dict
                 self._transition_open = not self.eval_mode
 
-            # Full planned trajectory: (num_timesteps, action_dim)
+            # Full planned trajectory: (num_timesteps, 5) — [x_n, y_n, z_n, wrist_roll_n, gripper_n]
             traj_norm = self.runner.learner.planner._opt_controls[0].detach().cpu().numpy()
 
-            # Build action chunk — propagate joint positions so delta-clamping is consistent
+            # Build action chunk.
+            # current_arm_deg: 5 arm joints used as IK warm-start (propagated per step).
+            # current_ee:      EE xyz used for Cartesian speed limiting (propagated per step).
             timed_actions = []
-            current = joint_state.copy()
-            gripper_index = ACTION_DIM - 1
+            current_arm_deg = joint_state[:5].copy()
+            current_ee      = _fk(current_arm_deg)
+            # Log MPPI output every 20 steps to diagnose action direction
+            if self._episode_steps % 20 == 0:
+                _raw = traj_norm[0]  # first planned step, pre-LPF
+                logger.info(
+                    f"[mppi] x={_raw[0]:+.3f}  y={_raw[1]:+.3f}  z={_raw[2]:+.3f}  "
+                    f"wrist={_raw[3]:+.3f}  grip={_raw[4]:+.3f}  "
+                    f"EE_y={current_ee[1]:+.4f}m  pan={joint_state[0]:+.1f}deg"
+                )
             update_gripper = (
                 self._last_gripper_deg is None
                 or self._gripper_chunk_count % self.gripper_update_every == 0
             )
             for t_offset, step_norm in enumerate(traj_norm):
-                action_norm = step_norm.copy()
-                if self.eval_mode and self._prev_action_norm is not None:
-                    action_norm = self._lpf_alpha * action_norm + (1 - self._lpf_alpha) * self._prev_action_norm
-                    action_norm = np.clip(action_norm, -1.0, 1.0)
-                if self.eval_mode:
-                    self._prev_action_norm = action_norm.copy()
-                step_deg = _to_degrees(action_norm, current, self.speed_scale)
-                if update_gripper:
-                    self._last_gripper_deg = float(step_deg[gripper_index])
+                action_norm = step_norm.copy()   # shape (5,): [x, y, z, wrist_roll, gripper]
+                if t_offset == 0:
+                    # LPF on xyz + wrist_roll only (indices 0-3); gripper is excluded
+                    # because it has its own hold mechanism (update_gripper / _last_gripper_deg).
+                    if self._prev_action_norm is not None:
+                        gripper_val = action_norm[4]   # save before blending
+                        action_norm = (self._lpf_alpha * action_norm
+                                       + (1 - self._lpf_alpha) * self._prev_action_norm)
+                        action_norm[4] = gripper_val   # restore unblended gripper
+                        action_norm = np.clip(action_norm, -1.0, 1.0)
+
+                    if update_gripper:
+                        self._prev_gripper_norm = float(action_norm[4])
+                    else:
+                        # Hold window: restore gripper to last committed norm
+                        if self._prev_gripper_norm is not None:
+                            action_norm[4] = self._prev_gripper_norm
+
+                    # IK: 5-dim norm → 6 joint degrees (returns effective post-projection action)
+                    step_deg, effective_norm = _action_norm_to_joints(
+                        action_norm, current_ee, current_arm_deg, self.speed_scale,
+                        current_gripper_deg=self._last_gripper_deg,
+                    )
+
+                    self._prev_action_norm = effective_norm.copy()
+
+                    # Sync replay buffer: store effective (post-projection) action so the
+                    # dynamics model learns that boundary = no movement in that direction.
+                    if not self.eval_mode:
+                        stored_norm = effective_norm.copy()
+                        if not update_gripper:
+                            # Gripper holding: store zero delta so dynamics sees no change.
+                            stored_norm[4] = 0.0
+                        self.runner.learner.transition.actions = torch.tensor(
+                            stored_norm, dtype=torch.float32
+                        ).unsqueeze(0).to(self.device)
                 else:
-                    step_deg[gripper_index] = self._last_gripper_deg
+                    step_deg, _ = _action_norm_to_joints(
+                        action_norm, current_ee, current_arm_deg, self.speed_scale,
+                        current_gripper_deg=self._last_gripper_deg,
+                    )
+
+                if update_gripper and t_offset == 0:
+                    # Only lock in the gripper from the executed step (t_offset=0).
+                    # Later horizon steps are not sent to the robot and must not
+                    # overwrite _last_gripper_deg with their raw (unfiltered) values.
+                    self._last_gripper_deg = float(step_deg[5])
+                elif not update_gripper:
+                    step_deg[5] = self._last_gripper_deg
+
                 timed_actions.append(TimedAction(
                     timestamp=timestamp,
                     timestep=timestep + t_offset,
                     action=torch.tensor(step_deg, dtype=torch.float32),
                 ))
+                # Propagate for next step's speed limiting and IK warm-start
+                current_arm_deg = step_deg[:5].copy()
+                current_ee      = _fk(current_arm_deg)
                 current = step_deg  # propagate so next step's delta is from the right base
             self._gripper_chunk_count += 1
 
@@ -429,17 +636,22 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
         if self.mock:
             self._episode_count += 1
             if self.recorder is not None:
-                self.recorder.flush()
+                # Pause recording immediately so observations sent while saving are discarded.
                 self._recording_paused = True
-                print(
-                    f"\n── Episode {self._episode_count} saved ──────────────────────────\n"
-                    f"   Press Enter to start recording episode {self._episode_count + 1} "
-                    f"(Ctrl-C to stop)...",
-                    flush=True,
-                )
-                threading.Thread(target=self._wait_for_enter, daemon=True).start()
+                ep = self._episode_count
+                def _save_and_wait():
+                    self.recorder.flush()  # slow disk write — runs in background
+                    print(
+                        f"\n── Episode {ep} saved ──────────────────────────\n"
+                        f"   Press Enter to start recording episode {ep + 1} "
+                        f"(Ctrl-C to stop)...",
+                        flush=True,
+                    )
+                    self._wait_for_enter()
+                threading.Thread(target=_save_and_wait, daemon=True).start()
             return
 
+        self._recording_paused = True   # discard observations during training
         train_stats = {}
         with self._lock:
             self._episode_count += 1
@@ -452,28 +664,69 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
             except Exception as exc:
                 logger.error(f"[ep {self._episode_count}] update() failed: {exc}")
                 self.runner.learner.eval()
-            self.runner.learner.planner.reset()
+            _done_idx = torch.zeros(1, dtype=torch.long, device=self.device)
+            self.runner.learner.planner.reset(reset_inds=_done_idx)
             self.runner.learner.storage.clear()
+
+        logger.info(f"[ep {self._episode_count}] training done")
+
+        disc_rewards = self._disc_rewards_this_ep[:]
+        episode_steps = self._episode_steps
 
         self._episode_steps = 0
         self._prev_obs_dict = None
         self._transition_open = False
-        self._prev_action_norm = None
-        self._last_gripper_deg = None
+        self._prev_action_norm  = None
+        self._last_gripper_deg  = None
+        self._prev_gripper_norm = None
         self._gripper_chunk_count = 0
-
-        logger.info(f"[ep {self._episode_count}] training done")
+        self._disc_rewards_this_ep = []
 
         if train_stats:
+            dyn    = train_stats.get('Dyn/mean_loss', 0)
+            reward = train_stats.get('Reward/mean_gen_reward', 0)
+            value  = train_stats.get('Value/mean_loss', 0)
+            policy = train_stats.get('Policy/mean_loss', 0)
             logger.info(
                 f"[ep {self._episode_count}] "
-                f"dyn={train_stats.get('Dyn/mean_loss', 0):.4f}  "
-                f"reward={train_stats.get('Reward/mean_gen_reward', 0):.4f}  "
-                f"value={train_stats.get('Value/mean_loss', 0):.4f}  "
-                f"policy={train_stats.get('Policy/mean_loss', 0):.4f}"
+                f"dyn={dyn:.4f}  reward={reward:.4f}  "
+                f"value={value:.4f}  policy={policy:.4f}"
             )
+            try:
+                import wandb as _wandb
+                if _wandb.run is not None:
+                    log_dict = {f"train/{k}": v for k, v in train_stats.items()
+                                if isinstance(v, (int, float))}
+                    log_dict["episode"] = self._episode_count
+                    log_dict["episode/steps"] = episode_steps
+                    if disc_rewards:
+                        log_dict["episode/disc_reward_mean"] = float(np.mean(disc_rewards))
+                        log_dict["episode/disc_reward_min"]  = float(np.min(disc_rewards))
+                        log_dict["episode/disc_reward_max"]  = float(np.max(disc_rewards))
+
+                    # MPPI statistics — action distribution mean & std per dimension
+                    with torch.no_grad():
+                        mppi_stats = self.runner.learner.planner.compute_stats()
+                    log_dict.update({k: float(v) for k, v in mppi_stats.items()
+                                     if isinstance(v, (int, float, torch.Tensor))
+                                     and (not isinstance(v, torch.Tensor) or v.numel() == 1)})
+                    # Per-dim action mean (first planned step)
+                    opt = self.runner.learner.planner._opt_controls[0, 0].detach().cpu()  # (nu,)
+                    dim_names = ["x", "y", "z", "wrist", "grip"]
+                    for i, name in enumerate(dim_names[:opt.shape[0]]):
+                        log_dict[f"MPPI/action_mean_{name}"] = float(opt[i])
+                    # Per-dim action std
+                    iter_std = self.runner.learner.planner.sampling._iter_std[0, 0].detach().cpu()  # (nu,)
+                    for i, name in enumerate(dim_names[:iter_std.shape[0]]):
+                        log_dict[f"MPPI/action_std_{name}"] = float(iter_std[i])
+
+                    _wandb.log(log_dict, step=self._episode_count)
+            except ImportError:
+                pass
         if self._episode_count % 20 == 0:
+            self.runner.current_learning_iteration = self._episode_count
             self.runner.save(postfix=f"ep{self._episode_count}")
+        self._recording_paused = False   # ready to record next episode
 
     def _wait_for_enter(self):
         """Block in a background thread until the user presses Enter, then resume recording."""
@@ -494,6 +747,10 @@ def serve():
     parser = argparse.ArgumentParser(description="MPAIL2 gRPC policy server for SO-101")
     parser.add_argument("--demo_path",    default=None,
                         help="Path to .pt demo file. Required unless --mock is set.")
+    parser.add_argument("--demo_subsample", type=int, default=30,
+                        help="Keep every Nth demo transition to match online control frequency. "
+                             "Demos collected at 30Hz with online at 1Hz → use 30 (default). "
+                             "Set to 1 to disable sub-sampling.")
     parser.add_argument("--mock",         action="store_true",
                         help="Skip runner; return home-position actions. Use with --collect_dir to record demos.")
     parser.add_argument("--collect_dir",  default=None,
@@ -507,17 +764,40 @@ def serve():
     parser.add_argument("--num_elites",   type=int, default=64)
     parser.add_argument("--opt_iters",    type=int, default=5)
     parser.add_argument("--latent_dim",   type=int, default=512)
-    parser.add_argument("--speed_scale",  type=float, default=0.3,
-                        help="Scale max joint delta per step (0.0=frozen, 1.0=full speed). Default 0.3.")
+    parser.add_argument("--speed_scale",  type=float, default=1.0,
+                        help="Scale max joint delta per step (0.0=frozen, 1.0=full speed). Default 1.0.")
+    parser.add_argument("--reward_scale", type=float, default=1.0,
+                        help="Scale factor applied to discriminator reward (default: 1.0). "
+                             "Reduces value/policy loss magnitude when raw reward is very large.")
+    parser.add_argument("--lpf_alpha", type=float, default=0.6,
+                        help="Low-pass filter weight on the new action (0=frozen, 1=no filter). "
+                             "Applied every step in both RL and eval modes. Default 0.6.")
     parser.add_argument("--gripper_update_every", type=int, default=5,
                         help="Only allow a new gripper command every N action chunks. "
                              "Use 1 to update the gripper every chunk. Default 5.")
+    parser.add_argument("--max_episode_steps", type=int, default=200,
+                        help="Hard cap on transitions recorded per episode. "
+                             "Steps beyond this are silently dropped. Default 200.")
     parser.add_argument("--load_checkpoint", default=None,
                         help="Path to a .pt checkpoint (e.g. logs/so101_grpc/models/model_ep40.pt) "
                              "to resume training from.")
     parser.add_argument("--eval", action="store_true",
                         help="Eval mode: load checkpoint, disable all training and exploration. "
                              "Requires --load_checkpoint.")
+    parser.add_argument("--joint_dim",        type=int, default=512,
+                        help="Output dim of the joint-state encoder stream (default: 1024 = 2× each camera stream).")
+    parser.add_argument("--show_cameras", action="store_true",
+                        help="Open a live OpenCV window showing both cameras side-by-side during training.")
+    parser.add_argument("--no_wrist_cam", action="store_true",
+                        help="Exclude wrist cam (cam) from encoder. Wrist cam looks down at gripper and "
+                             "adds noise for directional tasks — use RealSense (cam2) only for scene info.")
+    parser.add_argument("--replay_size", type=int, default=40_000,
+                        help="Replay buffer capacity in steps (default: 40000 = 200 episodes × 200 steps).")
+    parser.add_argument("--replay_batch_size", type=int, default=64,
+                        help="Replay buffer batch size for training (default: 64). Reduce to save GPU memory.")
+    parser.add_argument("--loss_horizon",    type=int, default=7,
+                        help="Trajectory horizon for training loss AND MPPI planning (default: 7). "
+                             "Must equal num_timesteps in PolicySamplingConfig — both are set together.")
     parser.add_argument("--wandb", action="store_true",
                         help="Enable Weights & Biases logging.")
     parser.add_argument("--wandb_project", default="so101-mpail2",
@@ -531,7 +811,11 @@ def serve():
     if args.eval and not args.load_checkpoint:
         parser.error("--eval requires --load_checkpoint.")
 
+    # Reduce CUDA memory fragmentation — helps when reserved-but-free > allocated
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
+    start_episode = 0
 
     # Demo recorder (optional)
     recorder = None
@@ -550,10 +834,16 @@ def serve():
 
         print(f"Loading demonstrations from {args.demo_path} ...")
         demonstrations = torch.load(args.demo_path, map_location="cpu", weights_only=False)
-        demo_keys = {OBS_KEY, CAM_KEY}
+        demo_keys = {OBS_KEY, CAM_KEY, CAM2_KEY}
         demonstrations = {k: v.float() for k, v in demonstrations.items() if k in demo_keys}
         if CAM_KEY not in demonstrations:
             raise RuntimeError(f"Demo file missing '{CAM_KEY}'. Keys: {list(demonstrations)}")
+        if CAM2_KEY not in demonstrations:
+            logger.warning(f"Demo file missing '{CAM2_KEY}' — training without RealSense camera.")
+            demonstrations[CAM2_KEY] = torch.zeros(
+                demonstrations[CAM_KEY].shape[:-1] + (CAM2_C,),
+                dtype=torch.float32
+            )
         if OBS_KEY not in demonstrations:
             raise RuntimeError(f"Demo file missing '{OBS_KEY}'. Keys: {list(demonstrations)}")
 
@@ -568,41 +858,107 @@ def serve():
             demonstrations[OBS_KEY] = demonstrations[OBS_KEY][..., :STATE_DIM]
             print(f"  [auto-trim] {OBS_KEY}: {state_demo_dim}D → {STATE_DIM}D (follower joints only)")
 
+        # Re-pair demo transitions to match online control frequency.
+        # Demos collected at 30Hz have (obs_t, obs_{t+1}) pairs with ~33ms jumps.
+        # Online training at 1Hz produces (obs_t, obs_{t+1}) pairs with ~1s jumps.
+        # Without re-pairing the discriminator trivially separates demo (tiny EE changes)
+        # from online (large EE changes) even at iteration 0 — the root cause of
+        # reward separation before any training.
+        # Fix: re-create pairs as (obs_at_t, obs_at_{t+K}) with K=demo_subsample.
+        if args.demo_subsample > 1:
+            K   = args.demo_subsample
+            N_d = next(iter(demonstrations.values())).shape[0]
+            n_new = N_d // K
+            idxs_start = np.arange(n_new) * K
+            idxs_end   = np.minimum(idxs_start + K - 1, N_d - 1)
+            for key in list(demonstrations.keys()):
+                t = demonstrations[key]          # [N_d, 2, ...]
+                new_t = torch.stack([
+                    t[torch.from_numpy(idxs_start), 0],   # obs  at t_start
+                    t[torch.from_numpy(idxs_end),   1],   # nobs at t_start+K
+                ], dim=1)
+                demonstrations[key] = new_t
+            print(f"  [re-pair ×{K}] {N_d} → {n_new} transitions  "
+                  f"(demo {K}Hz-steps ≈ online 1Hz steps)")
+
+        # Convert demo joint states → EE proprioception
+        print("  Converting demo joint states to EE proprioception (running FK)...")
+        demo_joints = demonstrations[OBS_KEY].numpy()   # [N, 2, 6]
+        N = demo_joints.shape[0]
+        ee_proprio = np.zeros((N, 2, EE_PROPRIO_DIM), dtype=np.float32)
+        for i in range(N):
+            for j in range(2):
+                ee_proprio[i, j] = _joints_to_ee_proprio(demo_joints[i, j])
+        demonstrations[OBS_KEY] = torch.from_numpy(ee_proprio)
+        print(f"  {OBS_KEY}: {tuple(demonstrations[OBS_KEY].shape)}  (EE proprio)")
+
         for k, v in demonstrations.items():
             print(f"  {k}: {tuple(v.shape)}")
 
         print("Building runner...")
-        env = make_so101_env(SO101RealEnvArgs(device=device, mock=True))
-        encoder_cfg = MultiCoderConfig(coder_list=[
-            MultiCoderConfig.ProprioCoderConfig(obs_key=OBS_KEY, input_dim=STATE_DIM, output_dim=64),
-            CNNCoderConfig(obs_key=CAM_KEY, H=CAM_H, W=CAM_W, C=CAM_C),
-        ])
+        env = make_so101_env(SO101RealEnvArgs(device=device, mock=True,
+                                              max_episode_length=args.max_episode_steps))
+        _coder_list = [
+            MultiCoderConfig.ProprioCoderConfig(obs_key=OBS_KEY, input_dim=EE_PROPRIO_DIM, output_dim=args.joint_dim),
+            CNNCoderConfig(obs_key=CAM2_KEY, H=CAM2_H, W=CAM2_W, C=CAM2_C),  # RealSense — global view, arm position visible
+        ]
+        if not args.no_wrist_cam:
+            _coder_list.append(
+                CNNCoderConfig(obs_key=CAM_KEY, H=CAM_H, W=CAM_W, C=CAM_C),  # wrist cam — gripper state only
+            )
+        encoder_cfg = MultiCoderConfig(coder_list=_coder_list)
         planner_cfg = PlannerConfig(
             encoder_cfg=encoder_cfg,
             action_dim=ACTION_DIM,
             latent_dim=args.latent_dim,
             sampling_cfg=PolicySamplingConfig(
                 num_rollouts=args.num_rollouts,
+                num_timesteps=args.loss_horizon,  # must match loss_horizon
                 policy_proportion=0.05,  # 5% policy rollouts, 95% random — same as Franka
-                min_std=0.05,
-                max_std=2.0,
+                min_std=0.1,
+                max_std=3.0,
             ),
             opt_iters=args.opt_iters,
             num_elites=args.num_elites,
         )
         learner_cfg = LearnerConfig(
             planner_cfg=planner_cfg,
-            replay_size=10_000,
-            replay_batch_size=256,
+            replay_size=args.replay_size,
+            replay_batch_size=args.replay_batch_size,
+            loss_horizon=args.loss_horizon,
             use_terminations=False,
-            obs_normalizer_cfg=ObsNormalizerCfg(normalization_type="fixed"),
+            obs_normalizer_cfg=ObsNormalizerCfg(normalization_type="cam_only"),
         )
         if args.wandb:
-            import wandb as _wandb
+            import dataclasses, wandb as _wandb
+
+            def _cfg_to_dict(obj, prefix=""):
+                """Recursively flatten a dataclass into a flat dict for wandb config."""
+                out = {}
+                if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+                    for f in dataclasses.fields(obj):
+                        val = getattr(obj, f.name)
+                        key = f"{prefix}{f.name}"
+                        if dataclasses.is_dataclass(val) and not isinstance(val, type):
+                            out.update(_cfg_to_dict(val, prefix=f"{key}."))
+                        elif isinstance(val, type):
+                            pass  # skip class references
+                        elif isinstance(val, dict):
+                            out[key] = str(val)
+                        elif isinstance(val, (int, float, str, bool, list, type(None))):
+                            out[key] = val
+                else:
+                    out[prefix.rstrip(".")] = str(obj)
+                return out
+
+            wandb_cfg = {**vars(args)}
+            wandb_cfg.update(_cfg_to_dict(learner_cfg, prefix="learner_cfg."))
+            wandb_cfg.update(_cfg_to_dict(planner_cfg, prefix="planner_cfg."))
+
             _wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_run_name,
-                config=vars(args),
+                config=wandb_cfg,
             )
             logger.info(f"W&B run: {_wandb.run.url}")
 
@@ -619,12 +975,21 @@ def serve():
         )
         os.makedirs(os.path.join(args.log_dir, "models"), exist_ok=True)
         runner = MPAIL2Runner(demonstrations=demonstrations, env=env, runner_cfg=runner_cfg, device=device)
+        start_episode = 0
         if args.load_checkpoint:
             print(f"Loading checkpoint from {args.load_checkpoint} ...")
             runner.load(args.load_checkpoint)
-            print("  Checkpoint loaded.")
+            _ckpt = torch.load(args.load_checkpoint, map_location="cpu", weights_only=False)
+            start_episode = int(_ckpt.get("iter", 0))
+            print(f"  Checkpoint loaded. Resuming from episode {start_episode}.")
+
+        # reward_scale is stored on the learner and applied only in value/policy updates,
+        # NOT in update_reward() — scaling discriminator output breaks the GP Lipschitz constraint.
+        runner.learner._reward_scale = float(args.reward_scale)
+        print(f"  Reward scale: {args.reward_scale}")
+
         runner.learner.eval()
-        print(f"Runner ready  device={device}  obs_dim={STATE_DIM}  action_dim={ACTION_DIM}")
+        print(f"Runner ready  device={device}  proprio_dim={EE_PROPRIO_DIM}  action_dim={ACTION_DIM}")
     else:
         logger.info("Mock mode — no runner loaded, returning home-position actions")
 
@@ -639,6 +1004,10 @@ def serve():
             speed_scale=args.speed_scale,
             eval_mode=args.eval,
             gripper_update_every=args.gripper_update_every,
+            lpf_alpha=args.lpf_alpha,
+            start_episode=start_episode,
+            max_episode_steps=args.max_episode_steps,
+            show_cameras=args.show_cameras,
         ),
         server,
     )

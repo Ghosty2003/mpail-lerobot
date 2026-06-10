@@ -76,17 +76,18 @@ class DictDemoDataset(torch.utils.data.Dataset):
                 yield (None, None)
                 continue
 
-            # Sample unique start indices without replacement using direct index computation
-            sample_indices = torch.randperm(self.num_samples, device=self.device)[:actual_batch_size]
+            # Sample unique start indices on CPU (demo tensors live on CPU)
+            sample_indices = torch.randperm(self.num_samples)[:actual_batch_size]
 
             # Build sequences using tensor indexing
             # Create time indices: (horizon, batch_size) where each column is start_idx + [0,1,2,...,horizon-1]
-            time_indices = sample_indices.unsqueeze(0) + torch.arange(self.horizon, device=self.device).unsqueeze(1)
+            time_indices = sample_indices.unsqueeze(0) + torch.arange(self.horizon).unsqueeze(1)
 
             # Index into demonstrations: [N, 2, *obs_shape]
             # time_indices has shape [horizon, batch_size], use advanced indexing
-            obs_batch = {k: v[time_indices, 0].transpose(0, 1) for k, v in self.demo_dict.items()}
-            next_obs_batch = {k: v[time_indices, 1].transpose(0, 1) for k, v in self.demo_dict.items()}
+            # Move to device after indexing so CPU demo tensors are indexed with CPU indices
+            obs_batch = {k: v[time_indices, 0].transpose(0, 1).to(self.device) for k, v in self.demo_dict.items()}
+            next_obs_batch = {k: v[time_indices, 1].transpose(0, 1).to(self.device) for k, v in self.demo_dict.items()}
 
             # Apply observation normalization if available
             if self.obs_normalizer is not None:
@@ -156,11 +157,13 @@ class RolloutStorage:
 
             self.replay_dim_size = math.ceil(replay_size / num_steps_per_env) # number of trajectories
 
+            # Store replay buffer on CPU to avoid GPU OOM with large image observations.
+            # Batches are moved to self.device at sample time in mini_traj_batch_generator.
             self.replay_data = {
-                "obs": {k: torch.zeros(num_steps_per_env, self.replay_dim_size, *v, device=self.device)
+                "obs": {k: torch.zeros(num_steps_per_env, self.replay_dim_size, *v, device='cpu')
                         for k, v in actor_obs_shape.items()},
-                "actions": torch.zeros(num_steps_per_env, self.replay_dim_size, *action_shape, device=self.device),
-                "dones": torch.zeros(num_steps_per_env, self.replay_dim_size, 1, device=self.device),
+                "actions": torch.zeros(num_steps_per_env, self.replay_dim_size, *action_shape, device='cpu'),
+                "dones": torch.zeros(num_steps_per_env, self.replay_dim_size, 1, device='cpu'),
             }
 
         self.num_trajectories_stored = 0
@@ -232,10 +235,10 @@ class RolloutStorage:
         dones = self.dones
 
         for k in self.actor_obs_shape.keys():
-            self.replay_data["obs"][k][:, self.num_trajectories_stored:end_indx] = obs[k][:, :num_to_add]
+            self.replay_data["obs"][k][:, self.num_trajectories_stored:end_indx] = obs[k][:, :num_to_add].cpu()
 
-        self.replay_data["actions"][:, self.num_trajectories_stored:end_indx] = actions[:, :num_to_add]
-        self.replay_data["dones"][:, self.num_trajectories_stored:end_indx] = dones[:, :num_to_add].to(torch.float32)
+        self.replay_data["actions"][:, self.num_trajectories_stored:end_indx] = actions[:, :num_to_add].cpu()
+        self.replay_data["dones"][:, self.num_trajectories_stored:end_indx] = dones[:, :num_to_add].to(torch.float32).cpu()
 
         self.num_trajectories_stored = end_indx
 
@@ -272,9 +275,9 @@ class RolloutStorage:
 
         start_idx = self.replay_dim_size - num_samples
         for k in self.actor_obs_shape.keys():
-            self.replay_data["obs"][k][:, start_idx:] = obs[k][:, num_added:num_added + num_samples]
-        self.replay_data["actions"][:, start_idx:] = actions[:, num_added:num_added + num_samples]
-        self.replay_data["dones"][:, start_idx:] = dones[:, num_added:num_added + num_samples].to(torch.float32)
+            self.replay_data["obs"][k][:, start_idx:] = obs[k][:, num_added:num_added + num_samples].cpu()
+        self.replay_data["actions"][:, start_idx:] = actions[:, num_added:num_added + num_samples].cpu()
+        self.replay_data["dones"][:, start_idx:] = dones[:, num_added:num_added + num_samples].to(torch.float32).cpu()
 
     def _compute_valid_starts(self, dones_data, horizon, max_start):
         """
@@ -297,6 +300,7 @@ class RolloutStorage:
         """
         T, num_trajs, _ = dones_data.shape
         dones = dones_data.squeeze(-1)  # [T, num_trajs]
+        device = dones_data.device  # follow input device (may be CPU for replay buffer)
 
         # For horizon=1, all positions are valid (no internal transitions to cross)
         if horizon <= 1:
@@ -311,7 +315,7 @@ class RolloutStorage:
         cumsum = torch.cumsum(dones.float(), dim=0)  # [T, num_trajs]
 
         # Pad with zeros at the start for easier indexing
-        padded = torch.cat([torch.zeros(1, num_trajs, device=self.device), cumsum], dim=0)  # [T+1, num_trajs]
+        padded = torch.cat([torch.zeros(1, num_trajs, device=device), cumsum], dim=0)  # [T+1, num_trajs]
 
         # For start position t, window is [t, t+H-1) (H-1 elements, excluding last step)
         # Number of dones in window = padded[t+H-1] - padded[t]
@@ -319,8 +323,8 @@ class RolloutStorage:
 
         # Compute done counts for each window [t, t+H-1) for t in [0, max_start]
         # window_dones[t, i] = number of dones in dones[t:t+H-1, i]
-        end_indices = torch.arange(horizon - 1, horizon - 1 + num_valid_starts, device=self.device)
-        start_indices = torch.arange(num_valid_starts, device=self.device)
+        end_indices = torch.arange(horizon - 1, horizon - 1 + num_valid_starts, device=device)
+        start_indices = torch.arange(num_valid_starts, device=device)
 
         window_dones = padded[end_indices, :] - padded[start_indices, :]  # [num_valid_starts, num_trajs]
 
@@ -406,13 +410,16 @@ class RolloutStorage:
         # Determine actual batch size based on available subsequences
         actual_batch_size = min(batch_size, max_subsequences)
 
+        # Replay buffer lives on CPU; index on CPU and move batch to GPU after sampling.
+        replay_device = replay_dones_traj.device
+
         for epoch in range(num_epochs):
             if actual_batch_size <= 0:
                 yield (None, None, None, None)
                 continue
 
-            # Sample unique subsequences without replacement
-            sample_indices = torch.randperm(max_subsequences, device=self.device)[:actual_batch_size]
+            # Sample unique subsequences without replacement (on CPU, matching replay device)
+            sample_indices = torch.randperm(max_subsequences, device=replay_device)[:actual_batch_size]
 
             if use_valid_indices:
                 # Index into precomputed valid (traj_idx, start_time) pairs
@@ -427,14 +434,14 @@ class RolloutStorage:
 
             # Build sequences using tensor indexing
             # Create time indices: (horizon, batch) where each column is start_time + [0,1,2,...,horizon-1]
-            time_indices = start_times.unsqueeze(0) + torch.arange(horizon, device=self.device).unsqueeze(1)
+            time_indices = start_times.unsqueeze(0) + torch.arange(horizon, device=replay_device).unsqueeze(1)
             # For next_obs, shift time indices by 1 (avoids expensive torch.roll on full buffer)
             next_time_indices = time_indices + 1
 
-            # Index directly from replay data - only allocates batch_size elements, not full buffer
-            obs_seq = {k: v[time_indices, traj_indices].transpose(0, 1)
+            # Index directly from replay data (CPU), then move batch to training device
+            obs_seq = {k: v[time_indices, traj_indices].transpose(0, 1).to(self.device)
                        for k, v in replay_obs_data.items()}
-            next_obs_seq = {k: v[next_time_indices, traj_indices].transpose(0, 1)
+            next_obs_seq = {k: v[next_time_indices, traj_indices].transpose(0, 1).to(self.device)
                            for k, v in replay_obs_data.items()}
 
             # Apply observation normalization on the batch (not the full buffer)
@@ -442,13 +449,13 @@ class RolloutStorage:
                 obs_seq = self.obs_normalizer(obs_seq)
                 next_obs_seq = self.obs_normalizer(next_obs_seq)
 
-            actions_seq = replay_actions_traj[time_indices, traj_indices].transpose(0, 1)
+            actions_seq = replay_actions_traj[time_indices, traj_indices].transpose(0, 1).to(self.device)
 
             # Get terminal mask for the last timestep of each subsequence
             # This tells the learner if the last transition ends in a terminal state
             # Shape: [batch_size] - True if done[t+H-1] == 1
             last_time_indices = time_indices[-1]  # [batch]
-            terminal_mask = replay_dones_traj[last_time_indices, traj_indices, 0].bool()  # [batch]
+            terminal_mask = replay_dones_traj[last_time_indices, traj_indices, 0].bool().to(self.device)
 
             yield (obs_seq, actions_seq, next_obs_seq, terminal_mask)
 
