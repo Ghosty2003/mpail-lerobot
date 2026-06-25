@@ -67,7 +67,6 @@ from mpail2.envs.real.so101.robot_limits import (
     EE_LOWER_M, EE_UPPER_M, MAX_DELTA_M,
     HOME_WRIST_ROLL_DEG, WRIST_ROLL_HALF_RANGE,
     HOME_GRIPPER_DEG, GRIPPER_HALF_RANGE,
-    GRIPPER_LOWER_DEG, GRIPPER_UPPER_DEG,
     JOINT_LOWER_DEG, JOINT_UPPER_DEG,
 )
 from ik_utils import fk as _fk, fk_pose as _fk_pose, ik as _ik
@@ -231,9 +230,9 @@ def _project_action_to_bounds(
 
     # Gripper: zero at limits (can't meaningfully reflect open/close)
     g = current_gripper_deg if current_gripper_deg is not None else float(HOME_GRIPPER_DEG)
-    if g <= float(GRIPPER_LOWER_DEG) and projected[4] < 0.0:
+    if g <= float(JOINT_LOWER_DEG[5]) and projected[4] < 0.0:
         projected[4] = 0.0
-    elif g >= float(GRIPPER_UPPER_DEG) and projected[4] > 0.0:
+    elif g >= float(JOINT_UPPER_DEG[5]) and projected[4] > 0.0:
         projected[4] = 0.0
 
     return projected
@@ -276,7 +275,7 @@ def _action_norm_to_joints(
     # ── Gripper — delta ──
     base_g = float(current_gripper_deg) if current_gripper_deg is not None else HOME_GRIPPER_DEG
     gripper_delta_deg = float(action_norm[4]) * float(GRIPPER_HALF_RANGE) * speed_scale
-    gripper_deg = float(np.clip(base_g + gripper_delta_deg, GRIPPER_LOWER_DEG, GRIPPER_UPPER_DEG))
+    gripper_deg = float(np.clip(base_g + gripper_delta_deg, JOINT_LOWER_DEG[5], JOINT_UPPER_DEG[5]))
 
     return np.append(arm_deg, gripper_deg).astype(np.float32), action_norm
 
@@ -302,7 +301,14 @@ class DemoRecorder:
         self._pending_images:  Dict[str, np.ndarray] = {}
         self._file_idx = 0
 
+    @staticmethod
+    def _to_uint8(img: np.ndarray) -> np.ndarray:
+        if img.max() <= 1.0:
+            return (img * 255).clip(0, 255).astype(np.uint8)
+        return img.clip(0, 255).astype(np.uint8)
+
     def record(self, obs: np.ndarray, images: Dict[str, np.ndarray]):
+        images_u8 = {k: self._to_uint8(v) for k, v in images.items()}
         with self._lock:
             if self._pending_obs is not None:
                 self._obs_buf.append(self._pending_obs)
@@ -310,11 +316,11 @@ class DemoRecorder:
                 for cam, img in self._pending_images.items():
                     self._image_bufs.setdefault(cam, []).append(img)
                     self._image_next_bufs.setdefault(cam, []).append(
-                        images.get(cam, img).copy()
+                        images_u8.get(cam, img).copy()
                     )
 
             self._pending_obs    = obs.copy()
-            self._pending_images = {k: v.copy() for k, v in images.items()}
+            self._pending_images = images_u8
 
             if len(self._obs_buf) >= self.flush_every:
                 self._flush()
@@ -341,7 +347,7 @@ class DemoRecorder:
             save_data[cam] = np.stack([imgs, nimgs], axis=1)           # (N, 2, H, W, C)
 
         path = self.collect_dir / f"traj_{self._file_idx:04d}.npz"
-        np.savez_compressed(str(path), **save_data)
+        np.savez(str(path), **save_data)
         n = len(self._obs_buf)
         cams = list(self._image_bufs.keys())
         logger.info(f"[recorder] Saved {n} steps → {path}  cameras={cams or 'none'}")
@@ -349,6 +355,8 @@ class DemoRecorder:
         self._obs_buf.clear(); self._next_obs_buf.clear()
         self._image_bufs.clear(); self._image_next_bufs.clear()
         self._file_idx += 1
+        self._pending_obs    = None
+        self._pending_images = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -758,7 +766,7 @@ def serve():
     parser.add_argument("--flush_every",  type=int, default=200,
                         help="Flush buffer to disk every N steps (default: 200).")
     parser.add_argument("--port",         type=int, default=8080)
-    parser.add_argument("--device",       default="auto")
+    parser.add_argument("--device",       default="cpu")
     parser.add_argument("--log_dir",      default="logs/so101_grpc")
     parser.add_argument("--num_rollouts", type=int, default=512)
     parser.add_argument("--num_elites",   type=int, default=64)
@@ -879,7 +887,7 @@ def serve():
                 ], dim=1)
                 demonstrations[key] = new_t
             print(f"  [re-pair ×{K}] {N_d} → {n_new} transitions  "
-                  f"(demo {K}Hz-steps ≈ online 1Hz steps)")
+                  f"(demo {K}Hz steps ≈ online 1Hz steps)")
 
         # Convert demo joint states → EE proprioception
         print("  Converting demo joint states to EE proprioception (running FK)...")
