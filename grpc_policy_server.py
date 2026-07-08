@@ -561,7 +561,8 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
                 logger.info(
                     f"[mppi] x={_raw[0]:+.3f}  y={_raw[1]:+.3f}  z={_raw[2]:+.3f}  "
                     f"wrist={_raw[3]:+.3f}  grip={_raw[4]:+.3f}  "
-                    f"EE_y={current_ee[1]:+.4f}m  pan={joint_state[0]:+.1f}deg"
+                    f"EE_y={current_ee[1]:+.4f}m  EE_z={current_ee[2]:+.4f}m  "
+                    f"pan={joint_state[0]:+.1f}deg"
                 )
             update_gripper = (
                 self._last_gripper_deg is None

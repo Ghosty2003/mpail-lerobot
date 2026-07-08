@@ -55,8 +55,8 @@ HOME_EE_M = np.array([0.2491, -0.0122, 0.1619], dtype=np.float32)  # metres
 MAX_DELTA_M = np.float32(0.03)   # metres per step at speed_scale=1.0
 
 # Hard workspace bounds — EE is clipped to this box after applying the delta.
-EE_LOWER_M = np.array([0.21,  -0.06,  0.102], dtype=np.float32)  # z floor: 6cm below home (0.162-0.06); x floor prevents backward drift
-EE_UPPER_M = np.array([0.45,   0.06,  0.21], dtype=np.float32)   # y: demo max +0.031m + margin; x: covers 0.350m reach
+EE_LOWER_M = np.array([0.14,  -0.075,  -0.01], dtype=np.float32)  # x: demo.pt reaches 0.1428m (1st pct 0.1496m); y: demo reaches -0.0716m (1st pct -0.0707m); z: demo reaches -0.0104m (1st pct -0.0099m)
+EE_UPPER_M = np.array([0.45,   0.08,  0.21], dtype=np.float32)   # y: demo max +0.0776m (99th pct +0.0748m) + margin; x: covers 0.350m reach
 
 # Kept for reference (not used in action mapping anymore).
 EE_HALF_RANGE_M = (EE_UPPER_M - EE_LOWER_M) / 2

@@ -20,8 +20,8 @@ controlled directly from the action (index 3 of the 5-dim action).
 import numpy as np
 
 URDF_PATH = (
-    "/home/chenmg93@netid.washington.edu"
-    "/TECHIN517/ros2_ws/src/soa_ros2/soa_description/urdf/soa.urdf"
+    "/home/robot"
+    "/Desktop/mpail-lerobot/soa.urdf"
 )
 
 # Full chain mask — all joints active for FK (wrist_roll included so FK is correct).
