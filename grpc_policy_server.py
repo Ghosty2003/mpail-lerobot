@@ -36,11 +36,8 @@ import pickle  # nosec
 import time
 
 import torch.nn.functional as F
-import sys
 import threading
-import types
 from concurrent import futures
-from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Dict, List, Optional
@@ -56,6 +53,7 @@ warnings.filterwarnings("ignore", message="Not enough SMs to use max_autotune_ge
 warnings.filterwarnings("ignore", message=".*pow_by_natural.*")
 
 from transport import services_pb2, services_pb2_grpc
+from lerobot.async_inference.helpers import TimedObservation, TimedAction
 
 from mpail2.envs.real.so101 import (
     SO101RealEnvArgs, make_so101_env, OBS_KEY, STATE_DIM, ACTION_DIM, EE_PROPRIO_DIM,
@@ -78,7 +76,8 @@ logger = logging.getLogger("grpc_policy_server")
 # ─────────────────────────────────────────────────────────────────────────────
 # CAMERA DISPLAY — live OpenCV window updated from a background thread
 # ─────────────────────────────────────────────────────────────────────────────
-
+# can be delete
+# pip install lerobot --no-deps --break-system-packages
 _CAM_SAVE_PATH = "cameras_latest.png"
 
 def _update_camera_display(image_arrays: dict) -> None:
@@ -111,48 +110,11 @@ def _update_camera_display(image_arrays: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PICKLE COMPAT — deserialize lerobot TimedObservation, send back TimedAction
+# PICKLE — deserialize lerobot TimedObservation, send back TimedAction
 # ─────────────────────────────────────────────────────────────────────────────
 
-@dataclass
-class _TimedData:
-    timestamp: float
-    timestep: int
-    def get_timestamp(self): return self.timestamp
-    def get_timestep(self):  return self.timestep
-
-@dataclass
-class TimedObservation(_TimedData):
-    observation: dict
-    must_go: bool = False
-    def get_observation(self): return self.observation
-
-@dataclass
-class TimedAction(_TimedData):
-    action: torch.Tensor
-    def get_action(self): return self.action
-
-TimedAction.__module__   = "lerobot.async_inference.helpers"
-TimedAction.__qualname__ = "TimedAction"
-_TimedData.__module__    = "lerobot.async_inference.helpers"
-_TimedData.__qualname__  = "TimedData"
-
-class _LeRobotUnpickler(pickle.Unpickler):
-    _MAP = {
-        ("lerobot.async_inference.helpers", "TimedObservation"): TimedObservation,
-        ("lerobot.async_inference.helpers", "TimedData"):        _TimedData,
-    }
-    def find_class(self, module, name):
-        return self._MAP.get((module, name)) or super().find_class(module, name)
-
 def _loads(data: bytes):
-    return _LeRobotUnpickler(io.BytesIO(data)).load()
-
-_lhm = types.ModuleType("lerobot.async_inference.helpers")
-_lhm.TimedData = _TimedData; _lhm.TimedAction = TimedAction; _lhm.TimedObservation = TimedObservation
-sys.modules.setdefault("lerobot", types.ModuleType("lerobot"))
-sys.modules.setdefault("lerobot.async_inference", types.ModuleType("lerobot.async_inference"))
-sys.modules["lerobot.async_inference.helpers"] = _lhm
+    return pickle.loads(data)  # nosec
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -969,6 +931,10 @@ def serve():
                 name=args.wandb_run_name,
                 config=wandb_cfg,
             )
+            # wandb.init() redirects stdout/stderr for its console capture; rebind our
+            # logging handler to whatever stream is current now, or every logger.info()
+            # call after this point silently writes to the old (now-orphaned) stderr.
+            logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
             logger.info(f"W&B run: {_wandb.run.url}")
 
         log_cfg = MPAIL2RunnerCfg.LogCfg(

@@ -81,6 +81,17 @@ def fk_pose(arm_joints_deg: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return xyz, quat
 
 
+def joints_to_ee_proprio(joint_state: np.ndarray) -> np.ndarray:
+    """Convert 6-dim joint state (degrees) to 13-dim proprioception.
+
+    Returns [ee_x, ee_y, ee_z, qx, qy, qz, qw, j0..j5] — matches Franka convention.
+    Shared by grpc_policy_server.py and mpail2/envs/real/so101/so101_env.py so both
+    build the exact same observation the trained encoder expects.
+    """
+    xyz, quat = fk_pose(joint_state[:5])
+    return np.concatenate([xyz, quat, joint_state], dtype=np.float32)
+
+
 def _jacobian(arm_joints_deg: np.ndarray, eps_deg: float = 0.5) -> np.ndarray:
     """Numerical position Jacobian d(xyz)/d(q) for the 4 position-controlling joints.
 

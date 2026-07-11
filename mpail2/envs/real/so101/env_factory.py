@@ -26,6 +26,9 @@ class SO101RealEnvArgs:
     state_dim: int = STATE_DIM
     action_dim: int = ACTION_DIM
     mock: bool = False
+    speed_scale: float = 1.0
+    lpf_alpha: float = 0.6
+    reset_pause_seconds: float = 3.0
 
 
 def make_so101_env(args: SO101RealEnvArgs | None = None) -> SO101RealWrapper:
@@ -38,5 +41,8 @@ def make_so101_env(args: SO101RealEnvArgs | None = None) -> SO101RealWrapper:
         control_frequency=args.control_hz,
         max_episode_steps=args.max_episode_length,
         mock=args.mock,
+        speed_scale=args.speed_scale,
+        lpf_alpha=args.lpf_alpha,
+        reset_pause_seconds=args.reset_pause_seconds,
     )
     return SO101RealWrapper(base, device=args.device)
