@@ -52,8 +52,6 @@ def main():
         description="Train MPAIL2 on the real SO-101 via the local gRPC env (no dropped observations)"
     )
     parser.add_argument("--demo_path", required=True, help="Path to .pt demo file (same format as grpc_policy_server.py)")
-    parser.add_argument("--demo_subsample", type=int, default=30,
-                         help="Keep every Nth demo transition to match online control frequency (default: 30).")
     parser.add_argument("--robot_host", default="127.0.0.1", help="so101_robot_server.py host")
     parser.add_argument("--robot_port", type=int, default=7070, help="so101_robot_server.py gRPC port")
     parser.add_argument("--device", default="cuda")
@@ -75,13 +73,18 @@ def main():
                          help="Fraction of MPPI rollouts drawn from the learned policy net vs pure "
                               "random exploration (default 0.05 = 95%% random, matches grpc_policy_server.py).")
     parser.add_argument("--latent_dim", type=int, default=512)
-    parser.add_argument("--joint_dim", type=int, default=512)
+    parser.add_argument("--joint_dim", type=int, default=256)
     parser.add_argument("--speed_scale", type=float, default=1.0)
-    parser.add_argument("--lpf_alpha", type=float, default=0.6,
+    parser.add_argument("--lpf_alpha", type=float, default=1.0,
                          help="Low-pass filter weight on the new action (0=frozen, 1=no filter). "
                               "Tames jerky/saturated MPPI output; speed_scale alone won't fix that "
                               "since it only rescales the envelope, not how often the action sits at it.")
     parser.add_argument("--reward_scale", type=float, default=1.0)
+    parser.add_argument("--gripper_hold_steps", type=int, default=1,
+                         help="Only accept a new gripper command every Nth step (holding the "
+                              "current target fixed the rest of the time), so gripper motion is a "
+                              "deliberate chunked open/close instead of raw per-step MPPI jitter. "
+                              "1 = update every step (default, unchanged behavior).")
     parser.add_argument("--max_episode_steps", type=int, default=200,
                          help="Steps per learn() iteration (one rollout before each update()).")
     parser.add_argument("--reset_pause_seconds", type=float, default=3.0,
@@ -89,7 +92,7 @@ def main():
                               "arm actually settles instead of immediately being commanded again.")
     parser.add_argument("--loss_horizon", type=int, default=7)
     parser.add_argument("--replay_size", type=int, default=40_000)
-    parser.add_argument("--replay_batch_size", type=int, default=64)
+    parser.add_argument("--replay_batch_size", type=int, default=256)
     parser.add_argument("--num_episodes", type=int, default=200,
                          help="Number of episodes to run. Each episode is one runner.learn() call "
                               "(max_episode_steps env steps + one update()), reset to home first.")
@@ -99,7 +102,22 @@ def main():
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", default="so101-mpail2-local")
     parser.add_argument("--wandb_run_name", default=None)
+    parser.add_argument("--eval", action="store_true",
+                         help="Roll the loaded checkpoint out on the robot with no training updates, "
+                              "no replay storage, no checkpoint saving — just act() + env.step(). "
+                              "Requires --load_checkpoint.")
+    parser.add_argument("--num_eval_episodes", type=int, default=10,
+                         help="Number of episodes to roll out when --eval is set.")
+    parser.add_argument("--eval_policy_only", action="store_true",
+                         help="During --eval, bypass CEM/MPPI entirely and use the policy network's "
+                              "own deterministic mean action every step (Planner.act_policy_only) — "
+                              "100%% policy-driven, no noise rollouts, no elite re-weighting. Default "
+                              "eval behavior otherwise still runs the full CEM search with "
+                              "deterministic=True on the final iteration.")
     args = parser.parse_args()
+
+    if args.eval and not args.load_checkpoint:
+        parser.error("--eval requires --load_checkpoint.")
 
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
@@ -116,23 +134,12 @@ def main():
             demonstrations[CAM_KEY].shape[:-1] + (CAM2_C,), dtype=torch.float32
         )
 
-    # Re-pace demos to match the online control frequency — same rationale as
-    # grpc_policy_server.py: without this the discriminator trivially separates
-    # demo (tiny per-frame EE motion) from online (larger per-step motion) transitions.
-    if args.demo_subsample > 1:
-        K = args.demo_subsample
-        N_d = next(iter(demonstrations.values())).shape[0]
-        n_new = N_d // K
-        idxs_start = np.arange(n_new) * K
-        idxs_end = np.minimum(idxs_start + K - 1, N_d - 1)
-        for key in list(demonstrations.keys()):
-            t = demonstrations[key]
-            demonstrations[key] = torch.stack([
-                t[torch.from_numpy(idxs_start), 0],
-                t[torch.from_numpy(idxs_end), 1],
-            ], dim=1)
-        print(f"  [re-pair x{K}] {N_d} -> {n_new} transitions")
-
+    # No re-pairing/subsampling: at the current control rate + speed_scale, online
+    # per-step EE motion (MAX_DELTA_M * speed_scale) is already the same single-digit-mm
+    # order of magnitude as the demo's raw per-frame motion, so there's no longer a large
+    # scale gap for the discriminator to trivially exploit — unlike when this was tuned
+    # against a 1Hz online control loop. Using demos in their raw recorded form also
+    # avoids re-pairing groups ever straddling two independently-recorded demo takes.
     print("  Converting demo joint states to EE proprioception (running FK)...")
     demo_joints = demonstrations[OBS_KEY].numpy()
     N = demo_joints.shape[0]
@@ -148,7 +155,8 @@ def main():
     env = make_so101_env(SO101RealEnvArgs(
         device=device, host=args.robot_host, port=args.robot_port,
         max_episode_length=args.max_episode_steps, speed_scale=args.speed_scale,
-        lpf_alpha=args.lpf_alpha, reset_pause_seconds=args.reset_pause_seconds, mock=False,
+        lpf_alpha=args.lpf_alpha, reset_pause_seconds=args.reset_pause_seconds,
+        gripper_hold_steps=args.gripper_hold_steps, mock=False,
     ))
 
     _coder_list = [
@@ -190,7 +198,7 @@ def main():
     # robot doesn't, so calling learn() once for many iterations would never re-home the arm).
     runner_cfg = MPAIL2RunnerCfg(
         learner_cfg=learner_cfg, log_cfg=log_cfg,
-        num_learning_iterations=1, logger=None, vis_rollouts=False,
+        num_learning_iterations=1, logger="wandb" if args.wandb else None, vis_rollouts=False,
     )
     os.makedirs(os.path.join(args.log_dir, "models"), exist_ok=True)
     runner = MPAIL2Runner(demonstrations=demonstrations, env=env, runner_cfg=runner_cfg, device=device)
@@ -217,6 +225,27 @@ def main():
     env.reward_fn = _disc_reward_fn
 
     print(f"Runner ready  device={device}  proprio_dim={EE_PROPRIO_DIM}  action_dim={ACTION_DIM}")
+
+    if args.eval:
+        print(f"Evaluating checkpoint: {args.num_eval_episodes} episodes of {args.max_episode_steps} "
+              f"steps each, no training updates "
+              f"({'policy-net only, no CEM' if args.eval_policy_only else 'full CEM, deterministic final iter'}) ...")
+        runner.learner.eval()
+        for episode in range(args.num_eval_episodes):
+            print(f"[eval episode {episode + 1}/{args.num_eval_episodes}] resetting to home, then rolling out ...")
+            obs, info = env.reset()
+            runner.learner.planner.reset()
+            for _ in range(args.max_episode_steps):
+                with torch.no_grad():
+                    if args.eval_policy_only:
+                        action = runner.learner.planner.act_policy_only(obs)
+                    else:
+                        action = runner.learner.planner.act(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = env.step(action.to(env.unwrapped.device))
+                if terminated or truncated:
+                    break
+        return
+
     print(f"Starting training: {args.num_episodes} episodes of {args.max_episode_steps} steps each ...")
 
     start_episode = runner.current_learning_iteration
@@ -224,6 +253,11 @@ def main():
         for episode in range(start_episode, start_episode + args.num_episodes):
             print(f"[episode {episode + 1}/{start_episode + args.num_episodes}] resetting to home, then rolling out ...")
             runner.learn()
+            # runner.learn() always runs exactly one iteration (runner_cfg.num_learning_iterations=1
+            # above) and its internal current_learning_iteration bookkeeping is a no-op for that
+            # case (it just resets to whatever it already was) — advance it here instead, or every
+            # checkpoint keeps overwriting "model_1.pt" and wandb's it/tot_iter never move.
+            runner.current_learning_iteration = episode + 1
     except KeyboardInterrupt:
         print("Interrupted — saving checkpoint before exit...")
         runner.save(postfix=f"ep{runner.current_learning_iteration}_interrupted")

@@ -5,15 +5,15 @@ Usage:
     python convert.py --dirs raw_demos2        # same
     python convert.py --dirs raw_demos raw_demos2 raw_demos3   # all demos
     python convert.py --out my_demos.pt        # custom output path
-    python convert.py --img_size 84            # resize cameras to 84x84 (default)
+    python convert.py --img_w 64 --img_h 48    # resize cameras to 64x48 (default, matches 640x480 aspect ratio)
 """
 
 import argparse
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 _IMG_KEY_PREFIXES = ("observation.images.",)
 
@@ -26,22 +26,28 @@ def _normalize_key(key: str) -> str:
     return key
 
 
-def _resize_cam(tensor: torch.Tensor, img_size: int) -> torch.Tensor:
-    """Resize camera tensor (N, 2, H, W, C) → (N, 2, img_size, img_size, C)."""
+def _resize_cam(tensor: torch.Tensor, out_w: int, out_h: int) -> torch.Tensor:
+    """Resize camera tensor (N, 2, H, W, C) → (N, 2, out_h, out_w, C).
+
+    Uses cv2.INTER_AREA to match the downsampling used for live camera frames
+    in so101_robot_server.py — keeping demo and online observations consistent.
+    out_w/out_h should match the source aspect ratio (e.g. 64x48 for 640x480
+    native capture) to avoid the anisotropic stretch a square resize would cause.
+    """
     N, two, H, W, C = tensor.shape
-    if H == img_size and W == img_size:
+    if H == out_h and W == out_w:
         return tensor
-    # (N,2,H,W,C) → (N*2, C, H, W) for interpolate
-    t = tensor.reshape(N * 2, H, W, C).permute(0, 3, 1, 2).float()
-    if t.max() > 1.0:
-        t = t / 255.0
-    t = F.interpolate(t, size=(img_size, img_size), mode="bilinear", align_corners=False)
-    # (N*2, C, img_size, img_size) → (N, 2, img_size, img_size, C)
-    t = t.permute(0, 2, 3, 1).reshape(N, 2, img_size, img_size, C)
-    return t
+    arr = tensor.reshape(N * two, H, W, C).numpy()
+    if arr.max() > 1.0:
+        arr = arr / 255.0
+    resized = np.stack([
+        cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+        for frame in arr
+    ])
+    return torch.from_numpy(resized).reshape(N, two, out_h, out_w, C)
 
 
-def convert(source_dirs: list[str], out_path: str, img_size: int = 84, state_dim: int | None = None) -> None:
+def convert(source_dirs: list[str], out_path: str, img_w: int = 64, img_h: int = 48, state_dim: int | None = None) -> None:
     all_data: dict = {}
     total_files = 0
 
@@ -61,7 +67,7 @@ def convert(source_dirs: list[str], out_path: str, img_size: int = 84, state_dim
                 arr = torch.from_numpy(d[raw_key].astype(np.float32))
                 # Resize cameras immediately to avoid holding 480×640 frames in RAM
                 if arr.dim() == 5:
-                    arr = _resize_cam(arr, img_size)
+                    arr = _resize_cam(arr, img_w, img_h)
                 all_data.setdefault(key, []).append(arr)
             total_files += 1
             print(f"  loaded {npz_file}  keys={list(d.files)}")
@@ -105,12 +111,16 @@ if __name__ == "__main__":
         help="Output .pt file path (default: raw_demos2_master.pt)",
     )
     parser.add_argument(
-        "--img_size", type=int, default=84,
-        help="Resize camera images to this square size (default: 84)",
+        "--img_w", type=int, default=64,
+        help="Resize camera images to this width (default: 64 — matches 640x480 native aspect ratio).",
+    )
+    parser.add_argument(
+        "--img_h", type=int, default=48,
+        help="Resize camera images to this height (default: 48 — matches 640x480 native aspect ratio).",
     )
     parser.add_argument(
         "--state_dim", type=int, default=None,
         help="Trim observation.state to this many dims (e.g. 6 if data has follower+leader=12)",
     )
     args = parser.parse_args()
-    convert(args.dirs, args.out, img_size=args.img_size, state_dim=args.state_dim)
+    convert(args.dirs, args.out, img_w=args.img_w, img_h=args.img_h, state_dim=args.state_dim)

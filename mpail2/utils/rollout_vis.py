@@ -3,7 +3,6 @@ import os
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-from matplotlib.cm import get_cmap
 from io import BytesIO
 import imageio
 from typing import TYPE_CHECKING
@@ -273,7 +272,7 @@ class RolloutsVisualization:
             self.fig, self.axes = plt.subplots(1, 2, figsize=(16, 8))
 
         # Add colorbar to visualize the normalized performance metrics
-        self.cmap = get_cmap("seismic_r")
+        self.cmap = mpl.colormaps["seismic_r"]
         if self.cost_range is None:
             norm = mpl.colors.Normalize(vmin=0, vmax=30)  # Default normalization
         else:

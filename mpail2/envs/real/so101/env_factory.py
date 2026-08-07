@@ -27,8 +27,9 @@ class SO101RealEnvArgs:
     action_dim: int = ACTION_DIM
     mock: bool = False
     speed_scale: float = 1.0
-    lpf_alpha: float = 0.6
+    lpf_alpha: float = 1.0
     reset_pause_seconds: float = 3.0
+    gripper_hold_steps: int = 1
 
 
 def make_so101_env(args: SO101RealEnvArgs | None = None) -> SO101RealWrapper:
@@ -44,5 +45,6 @@ def make_so101_env(args: SO101RealEnvArgs | None = None) -> SO101RealWrapper:
         speed_scale=args.speed_scale,
         lpf_alpha=args.lpf_alpha,
         reset_pause_seconds=args.reset_pause_seconds,
+        gripper_hold_steps=args.gripper_hold_steps,
     )
     return SO101RealWrapper(base, device=args.device)

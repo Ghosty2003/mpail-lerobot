@@ -13,8 +13,11 @@ IK method: Jacobian pseudo-inverse (differential IK), same principle as Franka's
 internal Cartesian controller.  Iterates: Δq = J⁺ Δx until convergence or max_iter.
 Uses damped least-squares (DLS) near singularities for numerical stability.
 
-wrist_roll is excluded from the Jacobian — it does not affect EE position and is
-controlled directly from the action (index 3 of the 5-dim action).
+wrist_roll is excluded from the Jacobian — it does not affect EE position. Both
+so101_env.py and grpc_policy_server.py use a 5-dim [x, y, z, wrist_roll, gripper]
+action and set wrist_roll directly from index 3 (delta-style); so101_env.py's
+xyz is an absolute position target, grpc_policy_server.py's is still a delta —
+only that difference remains between the two.
 """
 
 import numpy as np
@@ -121,7 +124,9 @@ def ik(
     xyz_target within tol_m, or max_iter is exhausted.  Uses damped least-squares
     (DLS) for stability near singularities.
 
-    wrist_roll (index 4) is never modified — the caller sets it from the action.
+    wrist_roll (index 4) is never modified here — both callers (so101_env.py,
+    grpc_policy_server.py) set it themselves from their own action's wrist_roll
+    component after calling this function.
 
     Args:
         xyz_target:      shape (3,) desired EE position in metres.
@@ -134,7 +139,7 @@ def ik(
         arm_joints_deg: shape (5,) float32 — shoulder_pan … wrist_roll.
     """
     if initial_arm_deg is None:
-        initial_arm_deg = np.array([8.0879, -6.0220, 2.9011, 87.7363, -0.2198], np.float32)
+        initial_arm_deg = np.array([-21.19, -5.41, 1.58, 99.47, -14.20], np.float32)
 
     q = initial_arm_deg.copy().astype(np.float64)
     target = xyz_target.astype(np.float64)

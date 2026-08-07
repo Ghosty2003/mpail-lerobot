@@ -52,7 +52,6 @@ from .robot_limits import (
     JOINT_LOWER_DEG,
     JOINT_NAMES,
     JOINT_UPPER_DEG,
-    MAX_DELTA_M,
     MAX_EPISODE_STEPS,
     WRIST_ROLL_HALF_RANGE,
     EE_PROPRIO_DIM,
@@ -70,6 +69,12 @@ except ImportError:
 
 # obs key used by planner_server.py (--obs_key default)
 OBS_KEY = "observation.state"
+
+# IK sanity-check threshold (degrees of joint movement per millimetre of requested
+# Cartesian delta) — see the warning logged in _action_norm_to_joints. A well-conditioned
+# solve in this workspace typically lands around 0.03-0.07 deg/mm; this is set well above
+# that so only genuinely disproportionate jumps (near-singularity/boundary behavior) fire.
+IK_SANITY_DEG_PER_MM = 0.3
 
 
 class SO101RobotEnv(gym.Env):
@@ -89,8 +94,9 @@ class SO101RobotEnv(gym.Env):
         max_episode_steps: int = MAX_EPISODE_STEPS,
         mock: bool = False,
         speed_scale: float = 1.0,
-        lpf_alpha: float = 0.6,
+        lpf_alpha: float = 1.0,
         reset_pause_seconds: float = 3.0,
+        gripper_hold_steps: int = 1,
     ):
         super().__init__()
 
@@ -118,6 +124,15 @@ class SO101RobotEnv(gym.Env):
         self._prev_action_norm = None
         self._step_count = 0
         self._consecutive_rpc_failures = 0
+        # Gripper is excluded from the LPF above (see step()) so it always tracks the raw
+        # commanded value with no smoothing lag — fine for a fast/light actuator, but it
+        # also means every step's fresh MPPI noise reaches the gripper directly. Holding
+        # the commanded gripper position fixed for gripper_hold_steps-1 out of every
+        # gripper_hold_steps steps turns that into a deliberate, chunked open/close
+        # command instead of continuous per-step jitter. 1 = update every step (default,
+        # unchanged behavior).
+        assert gripper_hold_steps >= 1, "gripper_hold_steps must be >= 1"
+        self.gripper_hold_steps = gripper_hold_steps
 
         # runner.py reads these from env.unwrapped
         self.num_envs = 1
@@ -208,25 +223,26 @@ class SO101RobotEnv(gym.Env):
             return self._mock_state() + (False,)
 
     # ─── action scaling ────────────────────────────────────────────────────────
-    # Same Cartesian-delta + IK conversion as grpc_policy_server.py's
-    # _project_action_to_bounds / _action_norm_to_joints, so this driver and the
-    # gRPC policy server move the robot identically given the same checkpoint.
+    # NOTE: this env's action space is [x, y, z, wrist_roll, gripper] with xyz as an
+    # ABSOLUTE position (see _action_norm_to_joints below) but wrist_roll/gripper still
+    # delta-style. grpc_policy_server.py's own _project_action_to_bounds /
+    # _action_norm_to_joints were NOT updated to match — it still uses the older
+    # all-delta Cartesian scheme. A checkpoint trained through one is not
+    # action-space-compatible with the other.
 
     def _project_action_to_bounds(
         self,
         action_norm: np.ndarray,
-        current_ee: np.ndarray,
         current_arm_deg: np.ndarray,
         current_gripper_deg: float,
     ) -> np.ndarray:
-        """Zero out action components that push against a hard boundary."""
-        projected = action_norm.copy()
+        """Zero out wrist_roll/gripper components that would push past a hard boundary.
 
-        for dim in range(3):
-            if current_ee[dim] <= float(EE_LOWER_M[dim]) and projected[dim] < 0.0:
-                projected[dim] = 0.0
-            elif current_ee[dim] >= float(EE_UPPER_M[dim]) and projected[dim] > 0.0:
-                projected[dim] = 0.0
+        xyz (indices 0-2) is an ABSOLUTE position command, not a delta, so there's no
+        "pushing against a wall" concept for it — clipping the mapped target into the
+        workspace box in _action_norm_to_joints is sufficient.
+        """
+        projected = action_norm.copy()
 
         wr = current_arm_deg[4]
         if wr <= float(JOINT_LOWER_DEG[4]) and projected[3] < 0.0:
@@ -245,6 +261,11 @@ class SO101RobotEnv(gym.Env):
     def _action_norm_to_joints(self, action_norm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Decode a 5-dim normalised action [x,y,z,wrist_roll,gripper] to 6 joint degrees via IK.
 
+        x,y,z is an ABSOLUTE target position: action_norm[:3] in [-1,1] maps linearly
+        onto the EE_LOWER_M/EE_UPPER_M workspace box (matches Kinova's Pick-and-Place
+        action space in the MPAIL2 paper — position commands, not a delta). wrist_roll
+        and gripper are still delta/increment style, same as before.
+
         Returns (joints_deg (6,), effective_action_norm (5,)) — effective_action_norm is the
         post-boundary-projection action, used by step() as the LPF reference for next step.
         """
@@ -252,21 +273,48 @@ class SO101RobotEnv(gym.Env):
         current_ee = _fk(current_arm_deg)
         current_gripper_deg = float(self._current_joints[5])
 
-        action_norm = self._project_action_to_bounds(
-            action_norm, current_ee, current_arm_deg, current_gripper_deg
-        )
+        action_norm = self._project_action_to_bounds(action_norm, current_arm_deg, current_gripper_deg)
 
-        max_d = float(MAX_DELTA_M * self.speed_scale)
-        delta_xyz = action_norm[:3].astype(np.float32) * max_d
-        target_xyz = np.clip(current_ee + delta_xyz, EE_LOWER_M, EE_UPPER_M)
+        target_xyz = EE_LOWER_M + (action_norm[:3].astype(np.float32) + 1.0) / 2.0 * (EE_UPPER_M - EE_LOWER_M)
+        target_xyz = np.clip(target_xyz, EE_LOWER_M, EE_UPPER_M)
 
         arm_deg = _ik(target_xyz, initial_arm_deg=current_arm_deg)
         arm_deg = np.clip(arm_deg, JOINT_LOWER_DEG[:5], JOINT_UPPER_DEG[:5])
 
+        # IK sanity check: a small requested Cartesian delta shouldn't produce a
+        # disproportionately large joint-angle jump. ik()'s DLS solve is redundant
+        # (3D position target, 4 DOF) with no explicit preference for staying close to
+        # the previous joint solution beyond the initial_arm_deg warm-start, so near a
+        # singularity or workspace-boundary configuration its chosen solution can shift
+        # a lot even for a tiny requested Cartesian delta — which then shows up
+        # downstream as a target the servo can't track, easily mistaken for a motor/
+        # settle problem when the actual target itself was the unstable part.
+        requested_delta_mm = float(np.linalg.norm(target_xyz - current_ee)) * 1000.0
+        joint_delta_deg = arm_deg - current_arm_deg
+        worst_idx = int(np.argmax(np.abs(joint_delta_deg)))
+        max_joint_delta_deg = float(np.abs(joint_delta_deg[worst_idx]))
+        if requested_delta_mm > 1e-3:
+            deg_per_mm = max_joint_delta_deg / requested_delta_mm
+            if deg_per_mm > IK_SANITY_DEG_PER_MM:
+                logger.warning(
+                    f"[ik] disproportionate joint jump: requested {requested_delta_mm:.2f}mm Cartesian "
+                    f"delta -> {max_joint_delta_deg:.2f}° on {JOINT_NAMES[worst_idx]} ({deg_per_mm:.2f}°/mm) "
+                    f"at EE={tuple(np.round(current_ee, 4).tolist())} target_xyz={tuple(np.round(target_xyz, 4).tolist())}"
+                )
+
+        # wrist_roll is back as an action component (index 3), delta-style — ik() itself
+        # still never touches index 4 of arm_deg (see its docstring), so we set it here.
         wrist_delta_deg = float(action_norm[3]) * float(WRIST_ROLL_HALF_RANGE) * self.speed_scale
         arm_deg[4] = float(np.clip(current_arm_deg[4] + wrist_delta_deg,
                                    JOINT_LOWER_DEG[4], JOINT_UPPER_DEG[4]))
 
+        # Only accept a new gripper command every gripper_hold_steps'th step (starting at
+        # step 0 of each episode); on held steps the target stays exactly where it is, and
+        # the effective action is zeroed to match (so logged/replayed action_executed
+        # reflects what was actually applied, not what was requested-but-held).
+        gripper_update_due = (self._step_count % self.gripper_hold_steps) == 0
+        if not gripper_update_due:
+            action_norm[4] = 0.0
         gripper_delta_deg = float(action_norm[4]) * float(GRIPPER_HALF_RANGE) * self.speed_scale
         gripper_deg = float(np.clip(current_gripper_deg + gripper_delta_deg,
                                     JOINT_LOWER_DEG[5], JOINT_UPPER_DEG[5]))

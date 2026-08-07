@@ -54,6 +54,7 @@ class RewardConfig(cfgs.RewardCfg):
         "use_layer_norm": False,
         "disable_output_bias": True,
     })
+    reward_clip: float = None
 
 @dataclass(kw_only=True)
 class EnsembleValueConfig(cfgs.EnsembleValueCfg):
@@ -154,7 +155,7 @@ class PolicySamplingConfig(cfgs.PolicySamplingCfg):
     num_timesteps: int = HORIZON
     policy_proportion: float = 0.05
     min_std: float = 0.05
-    max_std: float = 3.0
+    max_std: float = 2.0
     model_kwargs: dict = field(default_factory=lambda: {
         **MODEL_KWARGS,
     })
@@ -172,7 +173,7 @@ class PlannerConfig(cfgs.PlannerCfg):
 
     latent_dim: int = 512
     num_elites: int = 64
-    temperature: float = 1.0
+    temperature: float = 2.0
     opt_iters: int = OPT_ITERS
 
     reward_cfg: RewardConfig = field(default_factory=RewardConfig)
@@ -201,7 +202,7 @@ class ValueLearnerConfig(cfgs.ValueLearnerCfg):
 
     max_grad_norm: float = 5.0
 
-    polyak_tau: float = 0.05
+    polyak_tau: float = 0.01
 
 @dataclass(kw_only=True)
 class RewardLearnerConfig(cfgs.RewardLearnerCfg):
@@ -210,7 +211,7 @@ class RewardLearnerConfig(cfgs.RewardLearnerCfg):
 
     opt_params: dict = field(default_factory=lambda: OPT_PARAMS)
 
-    gp_coeff: float = 10.0
+    gp_coeff: float = 5.0
 
     gp_target_gradient: float = 1.0
 
@@ -236,7 +237,7 @@ class DynamicsLearnerConfig(cfgs.DynamicsLearnerCfg):
 
     opt_params: dict = field(default_factory=lambda: OPT_PARAMS)
 
-    enc_lr_scale: float = 0.02
+    enc_lr_scale: float = 0.08
 
     rho: float = 0.95
 
@@ -249,11 +250,11 @@ class LearnerConfig(cfgs.MPAIL2LearnerCfg):
     planner_cfg: cfgs.PlannerCfg = MISSING
 
     # Training parameters
-    replay_ratio: float = 0.5
+    replay_ratio: float = 1.0
 
     # Replay buffer settings
     replay_size: int = 100_000
-    replay_batch_size: int = 128
+    replay_batch_size: int = 256
 
     # Loss horizon for trajectory-based updates
     loss_horizon: int = HORIZON  # Match num_timesteps in sampling_cfg

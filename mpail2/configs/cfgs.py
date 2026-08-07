@@ -189,6 +189,13 @@ class RewardCfg:
 
     model_factory: Callable[[Any], torch.nn.Sequential] = mlp_factory
 
+    reward_clip: float = None
+    '''Clamp raw reward output to [-reward_clip, reward_clip]. None disables clamping.
+    The WGAN-style critic has no inherent output bound, and without one its scale can
+    drift arbitrarily over training (observed: mean_demo_reward climbing from ~6 to ~16
+    across iterations, Value/mean_q_value swinging from -187 to +164) — this bounds how
+    far that drift can propagate into the TD target / value loss.'''
+
 
 @dataclass(kw_only=True)
 class EnsembleValueCfg:

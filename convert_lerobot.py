@@ -8,13 +8,13 @@ Run in the LEROBOT conda env (lerobot must be installed):
         --root ./raw_lerobot_demos \
         --out raw_demos2_master.pt \
         --cam_name cam \
-        --img_size 84
+        --img_w 64 --img_h 48
 
 What it does
 ────────────
   For every consecutive frame pair (t, t+1) within each episode it builds:
     observation.state : (N, 2, STATE_DIM)   joint positions
-    cam               : (N, 2, 84, 84, 3)   camera frames, resized & in [0, 1]
+    cam               : (N, 2, 48, 64, 3)   camera frames, resized & in [0, 1]
 
   N = total transitions across all episodes (last frame of each episode is dropped
   because it has no t+1 counterpart).
@@ -26,12 +26,12 @@ The output file is ready for:
 import argparse
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 
-def convert(repo_id: str, root: str | None, out: str, cam_name: str, img_size: int):
+def convert(repo_id: str, root: str | None, out: str, cam_name: str, img_w: int, img_h: int):
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     print(f"Loading dataset  repo_id={repo_id}  root={root or 'hub'} ...")
@@ -81,16 +81,17 @@ def convert(repo_id: str, root: str | None, out: str, cam_name: str, img_size: i
                     img = img.float() / 255.0
                 cam_frames.append(img)         # (C, H, W) float [0,1]
 
-            # Stack → (T, C, H, W), resize, convert to (T, H, W, C)
-            cam_t  = torch.stack(cam_frames[:-1])   # (T-1, C, H, W)
-            cam_t1 = torch.stack(cam_frames[1:])    # (T-1, C, H, W)
+            # Stack → (T, C, H, W), resize (cv2.INTER_AREA, matching live camera
+            # downsampling in so101_robot_server.py), convert to (T, H, W, C)
+            cam_t  = torch.stack(cam_frames[:-1]).permute(0, 2, 3, 1).numpy()   # (T-1, H, W, C)
+            cam_t1 = torch.stack(cam_frames[1:]).permute(0, 2, 3, 1).numpy()    # (T-1, H, W, C)
 
-            cam_t  = F.interpolate(cam_t,  size=(img_size, img_size), mode="bilinear", align_corners=False)
-            cam_t1 = F.interpolate(cam_t1, size=(img_size, img_size), mode="bilinear", align_corners=False)
-
-            # (T-1, C, H, W) → (T-1, H, W, C)
-            cam_t  = cam_t.permute(0, 2, 3, 1).numpy()
-            cam_t1 = cam_t1.permute(0, 2, 3, 1).numpy()
+            cam_t  = np.stack([
+                cv2.resize(img, (img_w, img_h), interpolation=cv2.INTER_AREA) for img in cam_t
+            ])
+            cam_t1 = np.stack([
+                cv2.resize(img, (img_w, img_h), interpolation=cv2.INTER_AREA) for img in cam_t1
+            ])
 
             cam_pairs.append(np.stack([cam_t, cam_t1], axis=1))   # (T-1, 2, H, W, C)
 
@@ -124,8 +125,10 @@ if __name__ == "__main__":
     parser.add_argument("--cam_name", default="cam",
                         help="Camera name used during recording (default: cam). "
                              "This is the name after 'observation.images.' in the dataset.")
-    parser.add_argument("--img_size", type=int, default=84,
-                        help="Resize camera frames to this square size (default: 84)")
+    parser.add_argument("--img_w", type=int, default=64,
+                        help="Resize camera frames to this width (default: 64 — matches 640x480 aspect ratio)")
+    parser.add_argument("--img_h", type=int, default=48,
+                        help="Resize camera frames to this height (default: 48 — matches 640x480 aspect ratio)")
     args = parser.parse_args()
 
     convert(
@@ -133,5 +136,6 @@ if __name__ == "__main__":
         root=args.root,
         out=args.out,
         cam_name=args.cam_name,
-        img_size=args.img_size,
+        img_w=args.img_w,
+        img_h=args.img_h,
     )

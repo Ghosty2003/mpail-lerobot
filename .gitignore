@@ -6,3 +6,15 @@ models/
 wandb/
 outputs/
 build/
+
+# Large training data / checkpoints / logs — not source, don't belong in git
+demo.pt
+demo/
+raw_demo/
+raw_demos*/
+model_*.pt
+*.log
+
+# Camera snapshots — overwritten scratch diagnostics, not meaningful history
+realsense_snapshot.png
+wrist_snapshot.png

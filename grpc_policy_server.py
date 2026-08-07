@@ -69,7 +69,7 @@ from mpail2.envs.real.so101.robot_limits import (
 )
 from ik_utils import fk as _fk, fk_pose as _fk_pose, ik as _ik
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
 logger = logging.getLogger("grpc_policy_server")
 
 
@@ -340,6 +340,7 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
         start_episode: int = 0,
         max_episode_steps: int = 200,
         show_cameras: bool = False,
+        episode_pause_seconds: float = 5.0,
     ):
         self.runner      = runner      # None in mock mode
         self.device      = device
@@ -350,6 +351,10 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
         self.gripper_update_every = max(1, gripper_update_every)
         self.max_episode_steps = max_episode_steps
         self.show_cameras = show_cameras
+        # Mock/demo-recording only: auto-advance episodes by step count instead of
+        # waiting for a client-driven Ready() call (see _mock_episode_end).
+        self.episode_pause_seconds = episode_pause_seconds
+        self._mock_going_home = False
         if show_cameras:
             logger.info(f"[cameras] Saving live frames to {_CAM_SAVE_PATH} — open in VSCode to watch")
 
@@ -449,6 +454,18 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
             if self.recorder is not None:
                 self.recorder.record(joint_state, image_arrays)
 
+            # Mock mode has no GetActions-side step counter (that increment only runs
+            # in the non-mock branch), so _episode_steps would otherwise stay frozen at
+            # 0 forever during demo recording — track and log it here instead, and
+            # auto-advance to the next episode once max_episode_steps is reached rather
+            # than waiting on a client-driven Ready() call.
+            if self.mock and not self._recording_paused:
+                self._episode_steps += 1
+                logger.info(f"[ep {self._episode_count + 1} step {self._episode_steps}/{self.max_episode_steps}]")
+                if self._episode_steps >= self.max_episode_steps:
+                    self._recording_paused = True
+                    threading.Thread(target=self._mock_episode_end, daemon=True).start()
+
             # Push to obs queue so GetActions can respond
             if self._obs_queue.full():
                 try: self._obs_queue.get_nowait()
@@ -467,8 +484,13 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
             return services_pb2.Actions(data=b"")
 
         if self.mock:
-            # Echo current joints back — robot actively holds wherever it already is.
-            action_deg = joint_state.copy()
+            if self._mock_going_home:
+                # Episode just ended (max_episode_steps reached) — drive to home instead
+                # of holding in place, for the duration of _mock_episode_end's pause.
+                action_deg = HOME_POSITION_DEG.copy()
+            else:
+                # Echo current joints back — robot actively holds wherever it already is.
+                action_deg = joint_state.copy()
             timed_actions = [TimedAction(
                 timestamp=timestamp, timestep=timestep,
                 action=torch.tensor(action_deg, dtype=torch.float32),
@@ -602,6 +624,30 @@ class MPAILServicer(services_pb2_grpc.AsyncInferenceServicer):
             )
 
         return services_pb2.Actions(data=pickle.dumps(timed_actions))  # nosec
+
+    def _mock_episode_end(self):
+        """Auto-triggered once _episode_steps reaches max_episode_steps during mock/demo
+        recording — saves the episode, drives the arm home (via GetActions' mock branch
+        checking _mock_going_home), pauses episode_pause_seconds, then resumes recording.
+        Runs in a background thread so the request/response loop keeps moving while the
+        arm drives home and the recorder flushes to disk.
+        """
+        ep = self._episode_count + 1
+        self._episode_count = ep
+        logger.info(
+            f"[ep {ep}] {self.max_episode_steps} steps reached — saving and returning home "
+            f"(pausing {self.episode_pause_seconds:.1f}s before episode {ep + 1})..."
+        )
+        if self.recorder is not None:
+            self.recorder.flush()  # slow disk write — runs in background
+        self._mock_going_home = True
+        time.sleep(self.episode_pause_seconds)
+        self._mock_going_home = False
+        self._episode_steps = 0
+        if self.recorder is not None:
+            self.recorder.reset_pending()
+        self._recording_paused = False
+        logger.info(f"[ep {ep + 1}] recording started")
 
     def _on_episode_end(self):
         if self.mock:
@@ -747,8 +793,13 @@ def serve():
                         help="Only allow a new gripper command every N action chunks. "
                              "Use 1 to update the gripper every chunk. Default 5.")
     parser.add_argument("--max_episode_steps", type=int, default=200,
-                        help="Hard cap on transitions recorded per episode. "
-                             "Steps beyond this are silently dropped. Default 200.")
+                        help="Hard cap on transitions recorded per episode. In --mock mode this "
+                             "also auto-ends the episode (save, return home, pause, resume) "
+                             "instead of silently dropping steps beyond it.")
+    parser.add_argument("--episode_pause_seconds", type=float, default=5.0,
+                        help="Mock/demo-recording only: pause this long (arm held at home) after "
+                             "each episode's max_episode_steps is reached, before auto-resuming "
+                             "recording for the next episode.")
     parser.add_argument("--load_checkpoint", default=None,
                         help="Path to a .pt checkpoint (e.g. logs/so101_grpc/models/model_ep40.pt) "
                              "to resume training from.")
@@ -764,8 +815,8 @@ def serve():
                              "adds noise for directional tasks — use RealSense (cam2) only for scene info.")
     parser.add_argument("--replay_size", type=int, default=40_000,
                         help="Replay buffer capacity in steps (default: 40000 = 200 episodes × 200 steps).")
-    parser.add_argument("--replay_batch_size", type=int, default=64,
-                        help="Replay buffer batch size for training (default: 64). Reduce to save GPU memory.")
+    parser.add_argument("--replay_batch_size", type=int, default=256,
+                        help="Replay buffer batch size for training (default: 256). Reduce to save GPU memory.")
     parser.add_argument("--loss_horizon",    type=int, default=7,
                         help="Trajectory horizon for training loss AND MPPI planning (default: 7). "
                              "Must equal num_timesteps in PolicySamplingConfig — both are set together.")
@@ -983,6 +1034,7 @@ def serve():
             start_episode=start_episode,
             max_episode_steps=args.max_episode_steps,
             show_cameras=args.show_cameras,
+            episode_pause_seconds=args.episode_pause_seconds,
         ),
         server,
     )
