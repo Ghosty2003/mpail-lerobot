@@ -44,7 +44,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("npz", help="Path to .npz demo file")
     parser.add_argument("--port", default="/dev/ttyACM0", help="Follower arm serial port")
-    parser.add_argument("--robot_id", default="Kid_right")
+    parser.add_argument("--robot_id", default="Kid")
     parser.add_argument("--hz", type=float, default=10.0, help="Replay speed in Hz")
     parser.add_argument(
         "--state_cols", type=int, nargs="+", default=list(range(6)),

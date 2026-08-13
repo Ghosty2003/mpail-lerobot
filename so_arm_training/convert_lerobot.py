@@ -20,7 +20,7 @@ What it does
   because it has no t+1 counterpart).
 
 The output file is ready for:
-    python grpc_policy_server.py --demo_path raw_demos2_master.pt
+    python train_so101_local.py --demo_path raw_demos2_master.pt
 """
 
 import argparse

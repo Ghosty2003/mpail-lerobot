@@ -1,24 +1,26 @@
 """
 train_so101_local.py — Train MPAIL2 on the real SO-101 via the local, non-dropping
 gRPC env (mpail2/envs/real/so101), instead of the LeRobot async_inference /
-grpc_policy_server.py RPC-handler path.
+demo_recording_server.py RPC-handler path.
 
-Unlike grpc_policy_server.py (which reacts to inbound SendObservations/GetActions
+Unlike demo_recording_server.py (which reacts to inbound SendObservations/GetActions
 RPCs from a separately-running lerobot robot_client), this script drives the
 robot itself, in-process, via MPAIL2Runner.learn()'s standard rollout loop —
 env.step()/env.reset() block until the real action has been sent and the fresh
 post-action state read back, so no observation is ever dropped.
 
 Requires so101_robot_server.py to be running first (separate `lerobot` conda
-env, connected to the real arm + cameras):
+env, connected to the real arm + cameras). Run all so_arm_training scripts via
+`-m` from the repo root — see so_arm_training/README.md for why:
 
     conda activate lerobot
-    python so101_robot_server.py --robot_port /dev/ttyACM0 --robot_id Kid \\
+    python -m so_arm_training.so101_robot_server --robot_port /dev/ttyACM0 --robot_id Kid \\
         --cam_index /dev/video0 --cam2_serial <realsense_serial> --grpc_port 7070
 
 Then, in the `mpail2` conda env:
 
-    python train_so101_local.py --demo_path demo.pt --robot_host 127.0.0.1 \\
+    conda activate mpail2
+    python -m so_arm_training.train_so101_local --demo_path demo.pt --robot_host 127.0.0.1 \\
         --robot_port 7070 --device cuda --speed_scale 0.4 --wandb
 """
 
@@ -224,7 +226,10 @@ def main():
             return float(runner.learner._reward(z, zn).item())
     env.reward_fn = _disc_reward_fn
 
-    print(f"Runner ready  device={device}  proprio_dim={EE_PROPRIO_DIM}  action_dim={ACTION_DIM}")
+    print(
+        f"Runner ready  device={device}  proprio_dim={EE_PROPRIO_DIM}  action_dim={ACTION_DIM}  "
+        f"latent_dim={planner_cfg.latent_dim}"
+    )
 
     if args.eval:
         print(f"Evaluating checkpoint: {args.num_eval_episodes} episodes of {args.max_episode_steps} "

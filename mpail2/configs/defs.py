@@ -84,7 +84,10 @@ class CNNCoderConfig(cfgs.CNNCoderCfg):
     model_kwargs: dict = field(default_factory=lambda: {
         **CNN_MODEL_KWARGS,
         ## OVERRIDES ##
-        "override_last_layer_activation": True,
+        # Camera embedding ends in LayerNorm (normalized, zero-centered), not a
+        # trailing one-sided SiLU which distorts the geometry LayerNorm just
+        # established (ported from mpail-research fix-main #18).
+        "override_last_layer_norm": True,
     })
 
 @dataclass(kw_only=True)
@@ -96,9 +99,9 @@ class MultiCoderConfig(cfgs.MultiCoderCfg):
             **MODEL_KWARGS,
             ## OVERRIDES ##
             "hidden_dims": [256],
-            "use_layer_norm": False,
+            # Hidden LN on (inherited from MODEL_KWARGS), no trailing SiLU on the
+            # latent slice — same rationale as CNNCoderConfig above.
             "override_last_layer_norm": True,
-            "override_last_layer_activation": True,
         })
 
     model_kwargs:dict = field(default_factory=lambda: {
@@ -242,6 +245,13 @@ class DynamicsLearnerConfig(cfgs.DynamicsLearnerCfg):
     rho: float = 0.95
 
     recon_coeff: float = 1.0 # Exact coefficient doesn't matter if not using recon loss
+
+    # Conservative starting point (ported from mpail-research fix-main #18, which used
+    # 0.1 on a sim pick-place task) — start smaller so it doesn't swamp the JEP loss on
+    # this real-robot task before it's been tuned here.
+    sigreg_coeff: float = 0.02
+    sigreg_knots: int = 17
+    sigreg_num_proj: int = 1024
 
 @dataclass(kw_only=True)
 class LearnerConfig(cfgs.MPAIL2LearnerCfg):

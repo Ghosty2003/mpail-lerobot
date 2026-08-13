@@ -62,12 +62,15 @@ MAX_DELTA_M = np.float32(0.03)   # metres per step at speed_scale=1.0
 
 # Hard workspace bounds — EE is clipped to this box (xyz is an absolute position target,
 # see so101_env.py's _action_norm_to_joints). Tightened to the current demo.pt's actual
-# reach (recomputed via FK over all 3980 transitions):
-#   x: min=0.1440  1st pct=0.1572  99th pct=0.2260  max=0.2352
-#   y: min=-0.0691 1st pct=-0.0685 99th pct=0.0770   max=0.0814
-#   z: min=-0.0091 1st pct=-0.0073 99th pct=0.0871   max=0.0942
+# reach (recomputed via FK over all 5970 transitions, 2026-08-10 recording):
+#   x: min=0.1619  1st pct=0.1666  99th pct=0.2618  max=0.2782
+#   y: min=-0.0726 1st pct=-0.0657 99th pct=0.0586   max=0.0598
+#   z: min=-0.0141 1st pct=-0.0098 99th pct=0.0905   max=0.0923
+# x upper raised 0.24 -> 0.28 (demo max 0.2782 + margin) — the previous bound was
+# clipping ~9.6% of this demo's transitions before the target EE position was ever
+# reached, misaligning the demo's target with what the live env could actually hit.
 EE_LOWER_M = np.array([0.14,  -0.08,  -0.02], dtype=np.float32)
-EE_UPPER_M = np.array([0.24,   0.09,   0.10], dtype=np.float32)
+EE_UPPER_M = np.array([0.28,   0.09,   0.10], dtype=np.float32)
 
 # Kept for reference (not used in action mapping anymore).
 EE_HALF_RANGE_M = (EE_UPPER_M - EE_LOWER_M) / 2

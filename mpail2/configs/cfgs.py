@@ -273,6 +273,15 @@ class DynamicsLearnerCfg:
     enc_lr_scale: float = None
     '''Scaling factor for the encoder learning rate relative to the dynamics model learning rate.'''
 
+    sigreg_coeff: float = None
+    '''Coefficient for SIGReg auxiliary regularization loss (see mpail2.dynamics.SIGReg). Disabled when None or <= 0.'''
+
+    sigreg_knots: int = None
+    '''Number of integration knots used by SIGReg.'''
+
+    sigreg_num_proj: int = None
+    '''Number of random projection vectors used by SIGReg.'''
+
 
 @dataclass(kw_only=True)
 class PolicyLearnerCfg:

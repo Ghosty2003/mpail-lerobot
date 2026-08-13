@@ -123,8 +123,14 @@ class CamOnlyObsNormalizer(nn.Module):
             normalized_obs = {}
             for key, value in obs.items():
                 if isinstance(value, torch.Tensor) and "cam" in key.lower():
-                    # Camera observations: normalize to [-0.5, 0.5]
-                    normalized_obs[key] = value / 255.0 - 0.5
+                    # Camera observations: normalize to [-0.5, 0.5]. Some callers (e.g.
+                    # so101_env.py, convert.py) already divide by 255 before this point,
+                    # so dividing unconditionally here would silently double-divide and
+                    # crush the whole batch into a ~[0, 1/255] sliver near -0.5 (near-zero
+                    # variance regardless of image content). Only divide if still raw uint8
+                    # scale, mirroring the same max()>1.0 check convert.py already uses.
+                    scaled = value / 255.0 if value.max() > 1.0 else value
+                    normalized_obs[key] = scaled - 0.5
                 else:
                     # Pass through all other observations unchanged
                     normalized_obs[key] = value
@@ -139,8 +145,11 @@ class CamOnlyObsNormalizer(nn.Module):
             denormalized_obs = {}
             for key, value in normalized_obs.items():
                 if isinstance(value, torch.Tensor) and "cam" in key.lower():
-                    # Camera observations: denormalize from [-0.5, 0.5]
-                    denormalized_obs[key] = (value + 0.5) * 255.0
+                    # Undo forward()'s "- 0.5" back to [0, 1] — matches this codebase's
+                    # actual convention (so101_env.py/convert.py always hand forward()
+                    # already-[0,1] images, so forward() never multiplies by 255 in
+                    # practice; scaling back up to [0,255] here would be the wrong inverse).
+                    denormalized_obs[key] = value + 0.5
                 else:
                     # Pass through all other observations unchanged
                     denormalized_obs[key] = value
